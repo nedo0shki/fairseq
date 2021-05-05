@@ -228,4 +228,5 @@ PYBIND11_MODULE(libnat, m) {
       "suggested_ed2_path_with_delete",
       &suggested_ed2_path_with_delete,
       "suggested_ed2_path_with_delete");
+
 }

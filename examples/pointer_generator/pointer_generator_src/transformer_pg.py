@@ -5,7 +5,7 @@
 
 import logging
 from typing import Any, Dict, Optional
-
+import inspect
 import torch
 import torch.nn as nn
 from fairseq import metrics, utils
@@ -19,6 +19,7 @@ from fairseq.models.transformer import (
     TransformerModel,
     base_architecture,
 )
+from fairseq.models.roberta import RobertaModel
 from torch import Tensor
 
 
@@ -65,6 +66,10 @@ class TransformerPointerGeneratorModel(TransformerModel):
                             help='set the vocabulary distribution weight to P, '
                                  'instead of predicting it from the input (1.0 '
                                  'corresponding to generation, 0.0 to pointing)')
+        parser.add_argument('--pretrained', type=bool, metavar='EXPR',
+                            help='use pretrained model when training [True, ...]')
+        parser.add_argument('--pretrained-checkpoint', metavar='DIR',
+                            help='path to load checkpoint from pretrained model')
         # fmt: on
 
     @classmethod
@@ -109,33 +114,39 @@ class TransformerPointerGeneratorModel(TransformerModel):
                 embed_dict = utils.parse_embedding(path)
                 utils.load_embedding(embed_dict, dictionary, emb)
             return emb
+        #if args.pretrained:
+        if 0:
+            logger.info("loading pretrained model")
+            trained_model = RobertaModel.from_pretrained(args.pretrained_checkpoint, checkpoint_file='model.pt')
+            trained_model.eval()
 
-        if args.share_all_embeddings:
-            if args.encoder_embed_dim != args.decoder_embed_dim:
-                raise ValueError(
-                    "--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim"
-                )
-            if args.decoder_embed_path and (
-                args.decoder_embed_path != args.encoder_embed_path
-            ):
-                raise ValueError(
-                    "--share-all-embeddings not compatible with --decoder-embed-path"
-                )
-            encoder_embed_tokens = build_embedding(
-                src_dict, args.encoder_embed_dim, args.encoder_embed_path
-            )
-            decoder_embed_tokens = encoder_embed_tokens
-            args.share_decoder_input_output_embed = True
         else:
-            encoder_embed_tokens = build_embedding(
-                src_dict, args.encoder_embed_dim, args.encoder_embed_path
-            )
-            decoder_embed_tokens = build_embedding(
-                tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
-            )
+            if args.share_all_embeddings:
+                if args.encoder_embed_dim != args.decoder_embed_dim:
+                    raise ValueError(
+                        "--share-all-embeddings requires --encoder-embed-dim to match --decoder-embed-dim"
+                    )
+                if args.decoder_embed_path and (
+                    args.decoder_embed_path != args.encoder_embed_path
+                ):
+                    raise ValueError(
+                        "--share-all-embeddings not compatible with --decoder-embed-path"
+                    )
+                encoder_embed_tokens = build_embedding(
+                    src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                )
+                decoder_embed_tokens = encoder_embed_tokens
+                args.share_decoder_input_output_embed = True
+            else:
+                encoder_embed_tokens = build_embedding(
+                    src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                )
+                decoder_embed_tokens = build_embedding(
+                    tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+                )
 
-        encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
-        decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
+            encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
+            decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
         return cls(args, encoder, decoder)
 
     @classmethod
@@ -185,6 +196,16 @@ class TransformerPointerGeneratorEncoder(TransformerEncoder):
                   `(batch, src_len)`
         """
         encoder_out = super().forward(src_tokens, src_lengths, **kwargs)
+        '''
+        return {
+            "encoder_out": encoder_out[0],  # T x B x C
+            "encoder_padding_mask": encoder_out[1],  # B x T
+            "encoder_embedding": encoder_out[2],  # B x T x C
+            "encoder_states": encoder_out[3],  # List[T x B x C]
+            "src_tokens": [src_tokens],  # B x T
+            "src_lengths": [],
+        }
+        '''
         return {
             "encoder_out": encoder_out["encoder_out"],  # T x B x C
             "encoder_padding_mask": encoder_out["encoder_padding_mask"],  # B x T

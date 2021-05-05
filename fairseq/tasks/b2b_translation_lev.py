@@ -4,42 +4,180 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+import itertools
+import logging
+import os
 import torch
 from fairseq import utils
 from fairseq.data import LanguagePairDataset
 from fairseq.dataclass import ChoiceEnum
 from fairseq.tasks import register_task
-from fairseq.tasks.translation import TranslationConfig, TranslationTask, load_langpair_dataset
+from fairseq.tasks.translation import TranslationConfig, TranslationTask
+from fairseq.tasks.translation_lev import TranslationLevenshteinTask, TranslationLevenshteinConfig
+from fairseq.data import (
+    AppendTokenDataset,
+    ConcatDataset,
+    LanguagePairDataset,
+    PrependTokenDataset,
+    StripTokenDataset,
+    TruncateDataset,
+    data_utils,
+    encoders,
+    indexed_dataset,
+)
 from fairseq.utils import new_arange
 
 
-NOISE_CHOICES = ChoiceEnum(["random_delete", "random_mask", "no_noise", "full_mask"])
+
+
 EVAL_BLEU_ORDER = 4
-@dataclass
-class TranslationLevenshteinConfig(TranslationConfig):
-    noise: NOISE_CHOICES = field(
-        default="random_delete",
-        metadata={
-            "help": "type of noise"
-        },
+
+logger = logging.getLogger(__name__)
+
+def load_b2b_langpair_dataset(
+    data_path,
+    split,
+    src,
+    src_dict,
+    tgt,
+    tgt_dict,
+    combine,
+    dataset_impl,
+    upsample_primary,
+    left_pad_source,
+    left_pad_target,
+    max_source_positions,
+    max_target_positions,
+    prepend_bos=False,
+    load_alignments=False,
+    truncate_source=False,
+    append_source_id=False,
+    num_buckets=0,
+    shuffle=True,
+    pad_to_multiple=1,
+):
+    def split_exists(split, src, tgt, lang, data_path):
+        filename = os.path.join(data_path, "{}.{}-{}.{}".format(split, src, tgt, lang))
+        return indexed_dataset.dataset_exists(filename, impl=dataset_impl)
+
+    cls_idx = src_dict.index('[CLS]')
+    sep_idx = src_dict.index('[SEP]')
+
+    src_datasets = []
+    tgt_datasets = []
+
+    for k in itertools.count():
+        split_k = split + (str(k) if k > 0 else "")
+
+        # infer langcode
+        if split_exists(split_k, src, tgt, src, data_path):
+            prefix = os.path.join(data_path, "{}.{}-{}.".format(split_k, src, tgt))
+        elif split_exists(split_k, tgt, src, src, data_path):
+            prefix = os.path.join(data_path, "{}.{}-{}.".format(split_k, tgt, src))
+        else:
+            if k > 0:
+                break
+            else:
+                raise FileNotFoundError(
+                    "Dataset not found: {} ({})".format(split, data_path)
+                )
+
+        src_dataset = data_utils.load_indexed_dataset(
+            prefix + src, src_dict, dataset_impl
+        )
+        if truncate_source:
+            src_dataset = AppendTokenDataset(
+                TruncateDataset(
+                    StripTokenDataset(src_dataset, src_dict.eos()),
+                    max_source_positions - 1,
+                ),
+                src_dict.eos(),
+            )
+        src_datasets.append(src_dataset)
+
+        tgt_dataset = data_utils.load_indexed_dataset(
+            prefix + tgt, tgt_dict, dataset_impl
+        )
+        if tgt_dataset is not None:
+            tgt_datasets.append(tgt_dataset)
+
+        logger.info(
+            "{} {} {}-{} {} examples".format(
+                data_path, split_k, src, tgt, len(src_datasets[-1])
+            )
+        )
+
+        if not combine:
+            break
+
+    assert len(src_datasets) == len(tgt_datasets) or len(tgt_datasets) == 0
+
+    if len(src_datasets) == 1:
+        src_dataset = src_datasets[0]
+        tgt_dataset = tgt_datasets[0] if len(tgt_datasets) > 0 else None
+    else:
+        sample_ratios = [1] * len(src_datasets)
+        sample_ratios[0] = upsample_primary
+        src_dataset = ConcatDataset(src_datasets, sample_ratios)
+        if len(tgt_datasets) > 0:
+            tgt_dataset = ConcatDataset(tgt_datasets, sample_ratios)
+        else:
+            tgt_dataset = None
+
+    if prepend_bos:
+        assert hasattr(src_dict, "bos_index") and hasattr(tgt_dict, "bos_index")
+        src_dataset = PrependTokenDataset(src_dataset, src_dict.bos())
+        if tgt_dataset is not None:
+            tgt_dataset = PrependTokenDataset(tgt_dataset, tgt_dict.bos())
+
+    src_dataset = AppendTokenDataset(PrependTokenDataset(StripTokenDataset(src_dataset, src_dict.eos()), cls_idx),sep_idx)
+    tgt_dataset = AppendTokenDataset(PrependTokenDataset(StripTokenDataset(tgt_dataset, src_dict.eos()), cls_idx),sep_idx)
+
+    eos = None
+    if append_source_id:
+        src_dataset = AppendTokenDataset(
+            src_dataset, src_dict.index("[{}]".format(src))
+        )
+        if tgt_dataset is not None:
+            tgt_dataset = AppendTokenDataset(
+                tgt_dataset, tgt_dict.index("[{}]".format(tgt))
+            )
+        eos = tgt_dict.index("[{}]".format(tgt))
+
+    align_dataset = None
+    if load_alignments:
+        align_path = os.path.join(data_path, "{}.align.{}-{}".format(split, src, tgt))
+        if indexed_dataset.dataset_exists(align_path, impl=dataset_impl):
+            align_dataset = data_utils.load_indexed_dataset(
+                align_path, None, dataset_impl
+            )
+
+    tgt_dataset_sizes = tgt_dataset.sizes if tgt_dataset is not None else None
+    return LanguagePairDataset(
+        src_dataset,
+        src_dataset.sizes,
+        src_dict,
+        tgt_dataset,
+        tgt_dataset_sizes,
+        tgt_dict,
+        left_pad_source=left_pad_source,
+        left_pad_target=left_pad_target,
+        align_dataset=align_dataset,
+        eos=eos,
+        num_buckets=num_buckets,
+        shuffle=shuffle,
+        pad_to_multiple=pad_to_multiple,
     )
-    init_tokens: ChoiceEnum(["empty", "src"]) = field(
-        default="empty",
-        metadata={
-            "help": "type of output initialization"
-        },
-    )
 
-
-
-@register_task("translation_lev", dataclass=TranslationLevenshteinConfig)
-class TranslationLevenshteinTask(TranslationTask):
+@register_task("b2b_translation_lev", dataclass=TranslationLevenshteinConfig)
+class b2bTranslationLevenshteinTask(TranslationLevenshteinTask):
     """
     Translation (Sequence Generation) task for Levenshtein Transformer
     See `"Levenshtein Transformer" <https://arxiv.org/abs/1905.11006>`_.
     """
 
     cfg: TranslationLevenshteinConfig
+
 
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
         """Load a given dataset split.
@@ -54,7 +192,7 @@ class TranslationLevenshteinTask(TranslationTask):
         # infer langcode
         src, tgt = self.cfg.source_lang, self.cfg.target_lang
 
-        self.datasets[split] = load_langpair_dataset(
+        self.datasets[split] = load_b2b_langpair_dataset(
             data_path,
             split,
             src,
@@ -67,92 +205,10 @@ class TranslationLevenshteinTask(TranslationTask):
             left_pad_source=self.cfg.left_pad_source,
             left_pad_target=self.cfg.left_pad_target,
             max_source_positions=self.cfg.max_source_positions,
-            max_target_positions=self.cfg.max_target_positions,
-            prepend_bos=True,
+            max_target_positions=self.cfg.max_target_positions
         )
 
-    def inject_noise(self, target_tokens):
-        def _random_delete(target_tokens):
-            pad = self.tgt_dict.pad()
-            bos = self.tgt_dict.bos()
-            eos = self.tgt_dict.eos()
 
-            max_len = target_tokens.size(1)
-            target_mask = target_tokens.eq(pad)
-            target_score = target_tokens.clone().float().uniform_()
-            target_score.masked_fill_(
-                target_tokens.eq(bos) | target_tokens.eq(eos), 0.0
-            )
-            target_score.masked_fill_(target_mask, 1)
-            target_score, target_rank = target_score.sort(1)
-            target_length = target_mask.size(1) - target_mask.float().sum(
-                1, keepdim=True
-            )
-
-            # do not delete <bos> and <eos> (we assign 0 score for them)
-            target_cutoff = (
-                2
-                + (
-                    (target_length - 2)
-                    * target_score.new_zeros(target_score.size(0), 1).uniform_()
-                ).long()
-            )
-            target_cutoff = target_score.sort(1)[1] >= target_cutoff
-
-            prev_target_tokens = (
-                target_tokens.gather(1, target_rank)
-                .masked_fill_(target_cutoff, pad)
-                .gather(1, target_rank.masked_fill_(target_cutoff, max_len).sort(1)[1])
-            )
-            prev_target_tokens = prev_target_tokens[
-                :, : prev_target_tokens.ne(pad).sum(1).max()
-            ]
-
-            return prev_target_tokens
-
-        def _random_mask(target_tokens):
-            pad = self.tgt_dict.pad()
-            bos = self.tgt_dict.bos()
-            eos = self.tgt_dict.eos()
-            unk = self.tgt_dict.unk()
-
-            target_masks = (
-                target_tokens.ne(pad) & target_tokens.ne(bos) & target_tokens.ne(eos)
-            )
-            target_score = target_tokens.clone().float().uniform_()
-            target_score.masked_fill_(~target_masks, 2.0)
-            target_length = target_masks.sum(1).float()
-            target_length = target_length * target_length.clone().uniform_()
-            target_length = target_length + 1  # make sure to mask at least one token.
-
-            _, target_rank = target_score.sort(1)
-            target_cutoff = new_arange(target_rank) < target_length[:, None].long()
-            prev_target_tokens = target_tokens.masked_fill(
-                target_cutoff.scatter(1, target_rank, target_cutoff), unk
-            )
-            return prev_target_tokens
-
-        def _full_mask(target_tokens):
-            pad = self.tgt_dict.pad()
-            bos = self.tgt_dict.bos()
-            eos = self.tgt_dict.eos()
-            unk = self.tgt_dict.unk()
-
-            target_mask = (
-                target_tokens.eq(bos) | target_tokens.eq(eos) | target_tokens.eq(pad)
-            )
-            return target_tokens.masked_fill(~target_mask, unk)
-
-        if self.cfg.noise == "random_delete":
-            return _random_delete(target_tokens)
-        elif self.cfg.noise == "random_mask":
-            return _random_mask(target_tokens)
-        elif self.cfg.noise == "full_mask":
-            return _full_mask(target_tokens)
-        elif self.cfg.noise == "no_noise":
-            return target_tokens
-        else:
-            raise NotImplementedError
 
     def build_generator(self, models, args, **unused):
         # add models input to match the API for SequenceGenerator
@@ -200,8 +256,8 @@ class TranslationLevenshteinTask(TranslationTask):
                 sample["prev_target"] = src_tokens
             elif self.cfg.init_tokens == 'empty':
                 initial_output_tokens = src_tokens.new_zeros(src_tokens.size(0), 2)
-                initial_output_tokens[:, 0] = self.bos
-                initial_output_tokens[:, 1] = self.eos
+                initial_output_tokens[:, 0] = self.src_dict.index('[CLS]')
+                initial_output_tokens[:, 1] = self.src_dict.index('[SEP]')
                 sample["prev_target"] = initial_output_tokens
         else:
             sample["prev_target"] = self.inject_noise(sample["target"])
@@ -225,8 +281,8 @@ class TranslationLevenshteinTask(TranslationTask):
                     sample["prev_target"] = src_tokens
                 elif self.cfg.init_tokens == 'empty':
                     initial_output_tokens = src_tokens.new_zeros(src_tokens.size(0), 2)
-                    initial_output_tokens[:, 0] = self.bos
-                    initial_output_tokens[:, 1] = self.eos
+                    initial_output_tokens[:, 0] = self.src_dict.index('[CLS]')
+                    initial_output_tokens[:, 1] = self.src_dict.index('[SEP]')
                     sample["prev_target"] = initial_output_tokens
             else:
                 sample["prev_target"] = self.inject_noise(sample["target"])

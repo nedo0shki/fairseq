@@ -453,7 +453,6 @@ class FairseqTask(object):
             return generator.generate(
                 models, sample, prefix_tokens=prefix_tokens, constraints=constraints
             )
-
     def begin_epoch(self, epoch, model):
         """Hook function called before the start of each epoch."""
         pass

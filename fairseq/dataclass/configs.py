@@ -403,6 +403,35 @@ class DatasetConfig(FairseqDataclass):
             " (e.g. train, valid, test)"
         },
     )
+
+    proc_type: str = field(
+        default="bpe",
+        metadata={
+            "help": "type of data processing: bpe or pg"
+        }
+    )
+
+    raw_src_valid: str = field(
+        default="",
+        metadata={
+            "help": "path of src validation dataset for calculation of SARI score"
+        }
+    )
+    '''
+    proc_raw_src_valid: str = field(
+        default="",
+        metadata={
+            "help": "path of processed src validation dataset (word pieces if preprocessed by bpe, or including position markers if preprocessed by pointer generator) to input to the model"
+        }
+    )
+    '''
+    raw_ref_valid: str = field(
+        default="",
+        metadata={
+            "help": "path of reference(s) for a validation dataset for calculation of SARI score"
+        }
+    )
+
     validate_interval: int = field(
         default=1, metadata={"help": "validate every N epochs"}
     )

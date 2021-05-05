@@ -196,7 +196,6 @@ class SequenceGenerator(nn.Module):
             ],
         )
         net_input = sample["net_input"]
-
         if "src_tokens" in net_input:
             src_tokens = net_input["src_tokens"]
             # length of the source text being the character length except EndOfSentence and pad
@@ -240,7 +239,6 @@ class SequenceGenerator(nn.Module):
         ), "min_len cannot be larger than max_len, please adjust these!"
         # compute the encoder output for each beam
         encoder_outs = self.model.forward_encoder(net_input)
-
         # placeholder of indices for bsz * beam_size to hold tokens and accumulative scores
         new_order = torch.arange(bsz).view(-1, 1).repeat(1, beam_size).view(-1)
         new_order = new_order.to(src_tokens.device).long()
@@ -324,7 +322,6 @@ class SequenceGenerator(nn.Module):
                 incremental_states,
                 self.temperature,
             )
-
             if self.lm_model is not None:
                 lm_out = self.lm_model(tokens[:, : step + 1])
                 probs = self.lm_model.get_normalized_probs(
@@ -405,7 +402,6 @@ class SequenceGenerator(nn.Module):
             eos_bbsz_idx = torch.masked_select(
                 cand_bbsz_idx[:, :beam_size], mask=eos_mask[:, :beam_size]
             )
-
             finalized_sents: List[int] = []
             if eos_bbsz_idx.numel() > 0:
                 eos_scores = torch.masked_select(
@@ -550,6 +546,7 @@ class SequenceGenerator(nn.Module):
             finalized[sent] = torch.jit.annotate(
                 List[Dict[str, Tensor]], finalized[sent]
             )
+        #print("finalized: ", len(finalized))
         return finalized
 
     def _prefix_tokens(
@@ -766,6 +763,7 @@ class EnsembleModel(nn.Module):
         incremental_states: List[Dict[str, Dict[str, Optional[Tensor]]]],
         temperature: float = 1.0,
     ):
+        #print(tokens[:,tokens.shape[1]-1]>10001)
         log_probs = []
         avg_attn: Optional[Tensor] = None
         encoder_out: Optional[Dict[str, List[Tensor]]] = None
@@ -806,6 +804,12 @@ class EnsembleModel(nn.Module):
             )
             probs = probs[:, -1, :]
             if self.models_size == 1:
+                '''
+                if len(decoder_out) > 2:
+                    # to return p_gens
+                    return probs, attn, decoder_out[2]
+                else:
+                '''
                 return probs, attn
 
             log_probs.append(probs)
@@ -821,6 +825,7 @@ class EnsembleModel(nn.Module):
 
         if avg_attn is not None:
             avg_attn.div_(self.models_size)
+
         return avg_probs, avg_attn
 
     @torch.jit.export

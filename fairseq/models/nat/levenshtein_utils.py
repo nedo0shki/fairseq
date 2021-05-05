@@ -87,7 +87,10 @@ def _get_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx):
             + [0 for _ in range(in_seq_len - 1 - len(mask_input[1:-1]))]
             for mask_input in mask_inputs
         ]
-
+        print("in shape: ", in_tokens.shape)
+        print("out shape: ", out_tokens.shape)
+        for m in masked_tgt_masks:
+            print(len(m))
         # transform to tensor
         masked_tgt_masks = torch.tensor(
             masked_tgt_masks, device=out_tokens.device

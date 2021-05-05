@@ -19,6 +19,7 @@ from collections import namedtuple
 
 import numpy as np
 import torch
+from torch.utils.tensorboard import SummaryWriter
 from fairseq import checkpoint_utils, distributed_utils, options, tasks, utils
 from fairseq.data import encoders
 from fairseq.dataclass.configs import FairseqConfig
@@ -26,6 +27,7 @@ from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.token_generation_constraints import pack_constraints, unpack_constraints
 from fairseq_cli.generate import get_symbols_to_strip_from_output
 
+writer = SummaryWriter('/home/nshokran/baselines/experiments/pointer_generator')
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -103,7 +105,6 @@ def make_batches(lines, cfg, task, max_positions, encode_fn):
         src_tokens = batch["net_input"]["src_tokens"]
         src_lengths = batch["net_input"]["src_lengths"]
         constraints = batch.get("constraints", None)
-
         yield Batch(
             ids=ids,
             src_tokens=src_tokens,
@@ -157,7 +158,7 @@ def main(cfg: FairseqConfig):
         strict=(cfg.checkpoint.checkpoint_shard_count == 1),
         num_shards=cfg.checkpoint.checkpoint_shard_count,
     )
-
+    #print(models)
     # Set dictionaries
     src_dict = task.source_dictionary
     tgt_dict = task.target_dictionary
@@ -171,7 +172,6 @@ def main(cfg: FairseqConfig):
         if use_cuda and not cfg.distributed_training.pipeline_model_parallel:
             model.cuda()
         model.prepare_for_inference_(cfg)
-
     # Initialize generator
     generator = task.build_generator(models, cfg.generation)
 
@@ -234,6 +234,53 @@ def main(cfg: FairseqConfig):
             translations = task.inference_step(
                 generator, models, sample, constraints=constraints
             )
+
+
+            ''' check p_gen for different classes of words (repeated known vs repeated unknown vs new words)
+
+            max_len = len(translations[1])
+            num_sen = len(translations[0]) * 6
+            out_tokens = np.zeros((num_sen,max_len), dtype = int) + 2
+            s_num = 0
+            sen_finish = np.zeros((num_sen,max_len), dtype = int)
+            for ss in translations[0]:
+                finished_iter = 0
+                for s in ss:
+                    sen_tokens = s['tokens']
+                    finished_iter = max(finished_iter, sen_tokens.tolist().index(2))
+                    out_tokens[s_num, :len(sen_tokens)] = sen_tokens
+                    s_num = s_num + 1
+                sen_finish[s_num-6:s_num,finished_iter+1:] = 1
+            out_tokens_copied = np.zeros((num_sen,max_len), dtype = int)
+            for s in range(sample['net_input']['src_tokens'].shape[0]):
+                input_tokens = np.unique(sample['net_input']['src_tokens'][s,:])
+                for ss in np.arange(6*s, 6*(s+1)):
+                    curr_out_tokens = out_tokens[ss,:]
+                    is_copied = [o in input_tokens for o in curr_out_tokens]
+                    out_tokens_copied[ss,:] = is_copied
+            p_gens_mat = np.zeros((num_sen, max_len))
+            for i in range(max_len):
+                remained_sen = [id for id, f in enumerate(sen_finish[:,i]) if f == 0]
+                curr_p_gens = sum(sum(translations[1][i], []), [])
+                p_gens_mat[remained_sen,i] = curr_p_gens
+            copied_known = []
+            copied_unknown = []
+            generated_known = []
+            for i in range(p_gens_mat.shape[0]):
+                for j in range(p_gens_mat.shape[1]):
+                    if sen_finish[i,j] == 0:
+                        if out_tokens_copied[i,j] == 0:
+                            generated_known.append(p_gens_mat[i,j])
+                        if out_tokens_copied[i,j] == 1:
+                            if out_tokens[i,j] >= 10000:
+                                copied_unknown.append(p_gens_mat[i,j])
+                            else:
+                                copied_known.append(p_gens_mat[i,j])
+            print("copied_known: ", np.mean(copied_known))
+            print("copied_unknown: ", np.mean(copied_unknown))
+            print("generated_known: ", np.mean(generated_known))
+            '''
+
             translate_time = time.time() - translate_start_time
             total_translate_time += translate_time
             list_constraints = [[] for _ in range(bsz)]

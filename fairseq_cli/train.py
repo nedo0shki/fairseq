@@ -9,9 +9,11 @@ Train a new model on one or across multiple GPUs.
 
 import argparse
 import logging
+from torch.utils.tensorboard import SummaryWriter
 import math
 import os
 import sys
+import subprocess
 from typing import Dict, Optional, Any, List, Tuple, Callable
 
 import numpy as np
@@ -24,7 +26,7 @@ from fairseq import (
     tasks,
     utils,
 )
-from fairseq.data import iterators
+from fairseq.data import iterators, encoders
 from fairseq.dataclass.configs import FairseqConfig
 from fairseq.dataclass.utils import convert_namespace_to_omegaconf
 from fairseq.distributed_utils import is_master
@@ -66,9 +68,9 @@ def main(cfg: FairseqConfig) -> None:
 
     # Print args
     logger.info(cfg)
-
     # Setup task, e.g., translation, language modeling, etc.
     task = tasks.setup_task(cfg.task)
+
     # Load valid dataset (we load training data below, based on the latest checkpoint)
     for valid_sub_split in cfg.dataset.valid_subset.split(","):
         task.load_dataset(valid_sub_split, combine=False, epoch=1)
@@ -77,6 +79,7 @@ def main(cfg: FairseqConfig) -> None:
 
     # Build model and criterion
     model = task.build_model(cfg.model)
+    torch.save(model.state_dict(), "/home/nshokran/baselines/temp_bert_levt.bin")
     criterion = task.build_criterion(cfg.criterion)
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
@@ -131,6 +134,7 @@ def main(cfg: FairseqConfig) -> None:
     train_meter = meters.StopwatchMeter()
     train_meter.start()
     while epoch_itr.next_epoch_idx <= max_epoch:
+
         if lr <= cfg.optimization.stop_min_lr:
             logger.info(
                 f"stopping training because current learning rate ({lr}) is smaller "
@@ -236,12 +240,12 @@ def train(
     valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
+
     for i, samples in enumerate(progress):
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
         ):
             log_output = trainer.train_step(samples)
-
         if log_output is not None:  # not OOM, overflow, ...
             # log mid-epoch stats
             num_updates = trainer.get_num_updates()
@@ -341,6 +345,7 @@ def validate_and_save(
     # Validate
     valid_losses = [None]
     if do_validate:
+        #print("I'm validating")
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
 
     should_stop |= should_stop_early(cfg, valid_losses[0])
@@ -418,6 +423,142 @@ def validate(
         valid_losses.append(stats[cfg.checkpoint.best_checkpoint_metric])
     return valid_losses
 
+# based on ACCESS implementation
+
+def SARI_validate(
+    cfg: DictConfig,
+    trainer: Trainer,
+    task: tasks.FairseqTask,
+    epoch_itr,
+    subsets: List[str],
+) -> List[Optional[float]]:
+
+    import ast
+    from fairseq_cli.interactive import buffered_read, make_batches
+    #proc_src_filepath = cfg.dataset.proc_raw_src_valid
+    src_filepath = cfg.dataset.raw_src_valid
+    pred_dir = os.path.join(cfg.checkpoint.save_dir, "temp_results")
+    if not os.path.exists(pred_dir):
+        os.makedirs(pred_dir)
+    pred_filepath = os.path.join(pred_dir, "iter_" + str(trainer.get_num_updates()) + ".out")
+
+    parser = options.get_generation_parser(interactive=True)
+    gen_args = options.parse_args_and_arch(parser, input_args=['/home/nshokran/dummy_data', '--beam', '1'])
+    # Initialize generator
+    generator = task.build_generator([trainer.model],gen_args)
+    max_positions = utils.resolve_max_positions(
+        task.max_positions(),
+        trainer.get_model().max_positions(),
+    )
+    tokenizer = encoders.build_tokenizer(cfg.tokenizer)
+    bpe = encoders.build_bpe(cfg.bpe)
+
+    def encode_fn(x):
+        if tokenizer is not None:
+            x = tokenizer.encode(x)
+        if bpe is not None:
+            x = bpe.encode(x)
+        return x
+
+    def decode_fn(x):
+        if bpe is not None:
+            x = bpe.decode(x)
+        if tokenizer is not None:
+            x = tokenizer.decode(x)
+        return x
+
+    start_id = 0
+    print("starting translation")
+    with open(pred_filepath, 'w') as f:
+        for inputs in buffered_read(src_filepath, buffer_size=9999):
+            results = []
+            for batch in make_batches(inputs, cfg, task, max_positions, encode_fn):
+                src_tokens = batch.src_tokens
+                src_lengths = batch.src_lengths
+
+                if torch.cuda.is_available() and not cfg.common.cpu:
+                    src_tokens = src_tokens.cuda()
+                    src_lengths = src_lengths.cuda()
+
+                sample = {
+                    'net_input': {
+                        'src_tokens': src_tokens,
+                        'src_lengths': src_lengths,
+                    },
+                }
+                translations = task.inference_step(generator, [trainer.model], sample)
+                for i, (id, hypos) in enumerate(zip(batch.ids.tolist(), translations)):
+                    src_tokens_i = utils.strip_pad(src_tokens[i], task.target_dictionary.pad())
+                    results.append((start_id + id, src_tokens_i, hypos))
+
+
+            for id_, src_tokens, hypos in sorted(results, key=lambda x: x[0]):
+                if task.source_dictionary is not None:
+                    src_str = task.source_dictionary.string(src_tokens, cfg.common_eval.post_process)
+
+
+                # Process top predictions
+                # Process top predictions
+
+                for hypo in hypos[:min(len(hypos), gen_args.nbest)]:
+                    hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                        hypo_tokens=hypo['tokens'].int().cpu(),
+                        src_str=src_str,
+                        alignment=hypo['alignment'].int().cpu() if hypo['alignment'] is not None else None,
+                        align_dict=None,
+                        tgt_dict=task.target_dictionary,
+                        remove_bpe=cfg.common_eval.post_process,
+                    )
+                    detok_hypo_str = decode_fn(hypo_str)
+                    f.write(f'{detok_hypo_str}\n')
+
+
+            # update running id counter
+            start_id += len(results)
+    print("starting post processing")
+    sys.path.insert(1, '/home/nshokran/utils')
+    from utils import merge_word_pieces, read_lines
+    #if cfg.dataset.proc_type == 'bpe':
+    #    merge_word_pieces(pred_filepath,1)
+    if cfg.dataset.proc_type == 'pg':
+        cmd = "python /home/nshokran/baselines/seq2seq/fairseq/examples/pointer_generator/postprocess.py --source " + cfg.dataset.raw_src_valid + " --target " + pred_filepath + " --target-out " + pred_filepath + ".proc"
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+        cmd = "cp " + pred_filepath + ".proc " + pred_filepath
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+        cmd = "rm " + pred_filepath + ".proc"
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p.wait()
+    print("start reading files")
+    pred_sents = read_lines(pred_filepath)
+    src_sents = read_lines(cfg.dataset.raw_src_valid)
+    ref_sents = []
+    if os.path.isfile(cfg.dataset.raw_ref_valid):
+        ref_sents.append(read_lines(cfg.dataset.raw_ref_valid))
+    elif os.path.isdir(cfg.dataset.raw_ref_valid):
+        for ref_path in os.listdir(cfg.dataset.raw_ref_valid):
+            ref_sents.append(read_lines(os.path.join(cfg.dataset.raw_ref_valid,ref_path)))
+    from easse.sari import corpus_sari
+    print("starting calculating score")
+    SARI_score = corpus_sari(src_sents, pred_sents, ref_sents)
+    '''
+
+    cmd = "easse evaluate -t turkcorpus_valid -m 'bleu,sari,fkgl' --sys_sents_path " + proc_pred_filepath
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+    p.wait()
+    out,err = p.communicate()
+    out = out.decode("utf-8")[:-1]
+    out = ast.literal_eval(out)
+    SARI_score = out['sari']
+    ref_dir = "/home/nshokran/data/wikilarge/turkcorpus/tune_8turkers"
+    #SARI_score = SARIfiles(ori_complex_filepath, proc_pred_filepath, ref_dir)
+    '''
+    print("SARI score = ",SARI_score)
+    writer = SummaryWriter(os.path.join(cfg.common.tensorboard_logdir, 'SARI'))
+    writer.add_scalar('SARI', SARI_score, trainer.get_num_updates())
+    return[SARI_score]
+
 
 def get_valid_stats(
     cfg: DictConfig, trainer: Trainer, stats: Dict[str, Any]
@@ -438,7 +579,6 @@ def cli_main(
 ) -> None:
     parser = options.get_training_parser()
     args = options.parse_args_and_arch(parser, modify_parser=modify_parser)
-
     cfg = convert_namespace_to_omegaconf(args)
 
     if args.profile:

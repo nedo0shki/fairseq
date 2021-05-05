@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from fairseq.iterative_refinement_generator import DecoderOut
 from fairseq.models import register_model, register_model_architecture
-from fairseq.models.nat import FairseqNATDecoder, FairseqNATModel, ensemble_decoder
+from fairseq.models.nat import FairseqNATDecoder, FairseqNATModel, ensemble_decoder, LevenshteinTransformerModel
+from fairseq.models.nat.levenshtein_transformer import _random_delete, _expert_delete
 from fairseq.models.transformer import Embedding, TransformerDecoderLayer
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from fairseq.utils import new_arange
@@ -26,56 +27,94 @@ from .levenshtein_utils import (
 )
 
 
-def _random_delete(target_tokens, bos, eos, pad):
+def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict):
 
-    max_len = target_tokens.size(1)
-    target_mask = target_tokens.eq(pad)
-    target_score = target_tokens.clone().float().uniform_()
-    target_score.masked_fill_(
-        target_tokens.eq(bos) | target_tokens.eq(eos), 0.0
-    )
-    target_score.masked_fill_(target_mask, 1)
-    target_score, target_rank = target_score.sort(1)
-    target_length = target_mask.size(1) - target_mask.float().sum(
-        1, keepdim=True
-    )
-
-    # do not delete <bos> and <eos> (we assign 0 score for them)
-    target_cutoff = (
-        2
-        + (
-            (target_length - 2)
-            * target_score.new_zeros(target_score.size(0), 1).uniform_()
-        ).long()
-    )
-    target_cutoff = target_score.sort(1)[1] >= target_cutoff
-
-    prev_target_tokens = (
-        target_tokens.gather(1, target_rank)
-        .masked_fill_(target_cutoff, pad)
-        .gather(1, target_rank.masked_fill_(target_cutoff, max_len).sort(1)[1])
-    )
-    prev_target_tokens = prev_target_tokens[
-        :, : prev_target_tokens.ne(pad).sum(1).max()
-    ]
-
-    return prev_target_tokens
-
-def _expert_delete(prev_output_tokens, tgt_tokens, pad):
-
-    word_del_targets = _get_del_targets(prev_output_tokens, tgt_tokens, pad)
-    max_len = prev_output_tokens.size(1)
-    print("shape of word del targets: ", word_del_targets.size())
-    print("shape of prev_output_tokens: ", prev_output_tokens.size())
-    print("shape of tgt_tokens: ", tgt_tokens.size())
-    reordering = new_arange(prev_output_tokens).masked_fill_(word_del_targets.bool(), max_len).sort(1)[1]
-    del_tokens = prev_output_tokens.masked_fill(word_del_targets.bool(), pad).gather(1, reordering)
-    return del_tokens
+    embed_ln = re.compile("LayerNorm\.(weight|bias)")
+    self_attn = re.compile(r"layer\.(\d+)\.+attention.+((q)uery|(k)ey|(v)alue|(out)put\.dense|(output)\.LayerNorm)\.(weight|bias)")
+    ffns = re.compile(r"layer\.(\d+)\.(intermediate|output)\.dense\.(weight|bias)")
+    ffns_ln_p = re.compile(r"layer\.(\d+)\.output\.LayerNorm\.(weight|bias)")
 
 
+    for key in pretrained_state_dict.keys():
+        # print(key)
+        if "embeddings" in key:
+            if "word" in key:
+                new_key = "embed_tokens.weight"
+            elif "position" in key:
+                new_key = 'embed_positions.weight'
+            elif "type" in key:
+                new_key = None
+            else:
+                fs_embed_ln = "layernorm_embedding.{}"
+                new_key = fs_embed_ln.format(embed_ln.search(key).group(1))
+        elif "attention" in key:
+            # print(k)
+            groups = self_attn.search(key).groups()
+            fs_self_attn = "layers.{}.self_attn.{}_proj.{}"
+            fs_self_attn_ln = "layers.{}.self_attn_layer_norm.{}"
+            if "query" in key:
+                # print(fs_self_attn.format(groups[0], groups[2], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[2], groups[-1])
+            elif "key" in key:
+                # print(fs_self_attn.format(groups[0], groups[3], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[3], groups[-1])
+            elif "value" in key:
+                # print(fs_self_attn.format(groups[0], groups[4], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[4], groups[-1])
+            elif "output.dense" in key:
+                # print(fs_self_attn.format(groups[0], groups[5], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[5], groups[-1])
+            else:
+                # print(fs_self_attn_ln.format(groups[0], groups[-1]))
+                new_key = fs_self_attn_ln.format(groups[0], groups[-1])
+        elif "dense" in key and "pooler" not in key:
+            groups = ffns.search(key).groups()
+            # print(groups)
+            ffns_f1 = "layers.{}.fc1.{}"
+            ffns_f2 = "layers.{}.fc2.{}"
+            if "intermediate" in key:
+                # print(ffns_f1.format(groups[0], groups[-1]))
+                new_key = ffns_f1.format(groups[0], groups[-1])
+            else:
+                # print(ffns_f2.format(groups[0], groups[-1]))
+                new_key = ffns_f2.format(groups[0], groups[-1])
+        elif "LayerNorm" in key:
+            # print(key)
+            groups = ffns_ln_p.search(key).groups()
+            ffns_ln = "layers.{}.final_layer_norm.{}"
+            # print(groups)
+            # print(ffns_ln.format(groups[0], groups[-1]))
+            new_key = ffns_ln.format(groups[0], groups[-1])
 
-@register_model("levenshtein_transformer")
-class LevenshteinTransformerModel(FairseqNATModel):
+        else:
+            new_key = None
+
+        if new_key is not None:
+            # print(model[key].shape)
+            # print(new_key, key)
+            # print(state_dict[new_key].shape, pretrained_state_dict[key].shape)
+            assert new_key in state_dict, (
+                "{} Transformer encoder / decoder "
+                "state_dict does not contain {}. Cannot "
+                "load {} from pretrained XLM checkpoint "
+                "{} into Transformer.".format(
+                    str(state_dict.keys()),
+                    new_key, key, pretrained_state_dict)
+                )
+
+            if new_key == "embed_tokens.weight":
+                size = pretrained_state_dict[key].size(0)
+                state_dict[new_key][:size] = pretrained_state_dict[key]
+            else:
+                assert state_dict[new_key].shape == pretrained_state_dict[key].shape
+                state_dict[new_key] = pretrained_state_dict[key]
+
+    return state_dict
+
+
+
+@register_model("b2b_levenshtein_transformer")
+class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
     @property
     def allow_length_beam(self):
         return False
@@ -84,53 +123,40 @@ class LevenshteinTransformerModel(FairseqNATModel):
     def add_args(parser):
         FairseqNATModel.add_args(parser)
 
+
         parser.add_argument(
-            "--early-exit",
-            default="6,6,6",
-            type=str,
-            help="number of decoder layers before word_del, mask_ins, word_ins",
+            "--bert-checkpoint",
+            help="path of the bert state dict file",
         )
 
         parser.add_argument(
-            "--no-share-discriminator",
-            action="store_true",
-            help="separate parameters for discriminator",
+            "--init-CA-with-SA", action="store_true",
+            help="initialize cross attention weights with bert self attention weights",
         )
 
-        parser.add_argument(
-            "--no-share-maskpredictor",
-            action="store_true",
-            help="separate parameters for mask-predictor",
-        )
-
-        parser.add_argument(
-            "--share-discriminator-maskpredictor",
-            action="store_true",
-            help="share the parameters for both mask-predictor and discriminator",
-        )
-
-        parser.add_argument(
-            "--sampling-for-deletion",
-            action="store_true",
-            help="instead of argmax, use sampling to predict the tokens",
-        )
-
-        parser.add_argument(
-            "--dae-ratio",
-            type=float,
-            help="the probability of using noise injected target to learn the insertion policy",
-        )
-
-        parser.add_argument(
-            "--alpha-ratio",
-            type=float,
-            help="the probability of using init tokens to learn the deletion policy",
-        )
 
 
 
     def __init__(self, args, encoder, decoder):
+        print("init ca with sa is: ", getattr(args, "init_CA_with_SA"))
         super().__init__(args, encoder, decoder)
+        pretrained_bert = torch.load(getattr(args, "bert_checkpoint"))
+
+        loaded_state_dict = upgrade_state_dict_with_pretrained_weights(
+                encoder.state_dict(),
+                pretrained_bert,
+            )
+        encoder.load_state_dict(loaded_state_dict, strict=True)
+        decoder_state_dict = decoder.state_dict()
+        for k in decoder_state_dict.keys():
+            if k not in loaded_state_dict:
+                loaded_state_dict[k] = decoder_state_dict[k]
+        decoder.load_state_dict(loaded_state_dict, strict=True)
+
+        decoder_state_dict = decoder.state_dict()
+
+
+
 
     @classmethod
     def build_model(cls, args, task):
@@ -627,34 +653,37 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         return decoder_out, extra["attn"]
 
 
-@register_model_architecture("levenshtein_transformer", "levenshtein_transformer")
+@register_model_architecture("b2b_levenshtein_transformer", "b2b_levenshtein_transformer")
 def levenshtein_base_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
-    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
-    args.encoder_layers = getattr(args, "encoder_layers", 6)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
-    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
-    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 3072)
+    args.encoder_layers = getattr(args, "encoder_layers", 12)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 12)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
+
     args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_ffn_embed_dim = getattr(
         args, "decoder_ffn_embed_dim", args.encoder_ffn_embed_dim
     )
-    args.decoder_layers = getattr(args, "decoder_layers", 6)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
+    args.decoder_layers = getattr(args, "decoder_layers", 12)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 12)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
     args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
+
     args.attention_dropout = getattr(args, "attention_dropout", 0.0)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
-    args.activation_fn = getattr(args, "activation_fn", "relu")
+
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
     args.dropout = getattr(args, "dropout", 0.1)
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
     args.share_decoder_input_output_embed = getattr(
-        args, "share_decoder_input_output_embed", False
+        args, "share_decoder_input_output_embed", True
     )
-    args.share_all_embeddings = getattr(args, "share_all_embeddings", False)
+    args.share_all_embeddings = getattr(args, "share_all_embeddings", True)
     args.no_token_positional_embeddings = getattr(
         args, "no_token_positional_embeddings", False
     )
@@ -666,45 +695,10 @@ def levenshtein_base_architecture(args):
     )
     args.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
     args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
-    args.early_exit = getattr(args, "early_exit", "6,6,6")
+    args.early_exit = getattr(args, "early_exit", "12,12,12")
     args.no_share_discriminator = getattr(args, "no_share_discriminator", False)
     args.no_share_maskpredictor = getattr(args, "no_share_maskpredictor", False)
     args.share_discriminator_maskpredictor = getattr(
         args, "share_discriminator_maskpredictor", False
     )
     args.no_share_last_layer = getattr(args, "no_share_last_layer", False)
-
-
-@register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_wmt_en_de"
-)
-def levenshtein_transformer_wmt_en_de(args):
-    levenshtein_base_architecture(args)
-
-
-# similar parameters used in the "Attention Is All You Need" paper (Vaswani et al., 2017)
-@register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_vaswani_wmt_en_de_big"
-)
-def levenshtein_transformer_vaswani_wmt_en_de_big(args):
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
-    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4096)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
-    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
-    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 1024)
-    args.decoder_ffn_embed_dim = getattr(args, "decoder_ffn_embed_dim", 4096)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
-    args.dropout = getattr(args, "dropout", 0.3)
-    levenshtein_base_architecture(args)
-
-
-# default parameters used in tensor2tensor implementation
-@register_model_architecture(
-    "levenshtein_transformer", "levenshtein_transformer_wmt_en_de_big"
-)
-def levenshtein_transformer_wmt_en_de_big_t2t(args):
-    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
-    args.decoder_normalize_before = getattr(args, "decoder_normalize_before", True)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
-    args.activation_dropout = getattr(args, "activation_dropout", 0.1)
-    levenshtein_transformer_vaswani_wmt_en_de_big(args)

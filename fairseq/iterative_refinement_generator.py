@@ -5,8 +5,9 @@
 
 from collections import namedtuple
 
-import numpy as np
 import torch
+import numpy as np
+
 from fairseq import utils
 
 
@@ -30,10 +31,10 @@ class IterativeRefinementGenerator(object):
         adaptive=True,
         retain_history=False,
         reranking=False,
+        init_tokens=None,
     ):
         """
         Generates translations based on iterative refinement.
-
         Args:
             tgt_dict: target dictionary
             eos_penalty: if > 0.0, it penalized early-stopping in decoding
@@ -58,6 +59,7 @@ class IterativeRefinementGenerator(object):
         self.retain_history = retain_history
         self.adaptive = adaptive
         self.models = models
+        self.init_tokens = init_tokens
 
     def generate_batched_itr(
         self,
@@ -69,7 +71,6 @@ class IterativeRefinementGenerator(object):
         prefix_size=0,
     ):
         """Iterate over a batched dataset and yield individual translations.
-
         Args:
             maxlen_a/b: generate sequences of maximum length ax + b,
                 where x is the source sentence length.
@@ -99,11 +100,7 @@ class IterativeRefinementGenerator(object):
                 yield id, src, ref, hypos[i]
 
     @torch.no_grad()
-    def generate(self, models, sample, prefix_tokens=None, constraints=None):
-        if constraints is not None:
-            raise NotImplementedError(
-                "Constrained decoding with the IterativeRefinementGenerator is not supported"
-            )
+    def generate(self, models, sample, prefix_tokens=None):
 
         # TODO: iterative refinement generator does not support ensemble for now.
         if not self.retain_dropout:
@@ -132,8 +129,24 @@ class IterativeRefinementGenerator(object):
         bsz, src_len = src_tokens.size()
 
         # initialize
-        encoder_out = model.forward_encoder([src_tokens, src_lengths])
-        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens)
+        # encoder_out = model.forward_encoder([src_tokens, src_lengths])
+        encoder_out = model.forward_encoder(
+            [
+                sample["net_input"][inp]
+                for inp in sample["net_input"]
+                if inp != "prev_output_tokens"
+            ]
+        )
+        init_tokens = None
+        #if self.init_tokens is not None:
+        #    init_tokens = sample[self.init_tokens]
+        if self.init_tokens == 'src':
+            init_tokens = sample['net_input']['src_tokens']
+        if self.init_tokens == 'mt':
+            init_tokens = sample['mt']
+        prev_decoder_out = model.initialize_output_tokens(
+            encoder_out, src_tokens, init_tokens=init_tokens
+        )
 
         if self.beam_size > 1:
             assert (
@@ -204,8 +217,7 @@ class IterativeRefinementGenerator(object):
                 "decoding_format": self.decoding_format,
             }
             prev_decoder_out = prev_decoder_out._replace(
-                step=step,
-                max_step=self.max_iter + 1,
+                step=step, max_step=self.max_iter + 1,
             )
 
             decoder_out = model.forward_decoder(
@@ -221,9 +233,7 @@ class IterativeRefinementGenerator(object):
                     decoder_out.attn,
                 )
                 decoder_out = decoder_out._replace(
-                    output_tokens=out_tokens,
-                    output_scores=out_scores,
-                    attn=out_attn,
+                    output_tokens=out_tokens, output_scores=out_scores, attn=out_attn,
                 )
 
             else:
@@ -283,7 +293,7 @@ class IterativeRefinementGenerator(object):
                 else None,
             )
             encoder_out = model.encoder.reorder_encoder_out(
-                encoder_out, not_terminated.nonzero(as_tuple=False).squeeze()
+                encoder_out, not_terminated.nonzero().squeeze()
             )
             sent_idxs = sent_idxs[not_terminated]
             prev_output_tokens = prev_decoder_out.output_tokens.clone()
