@@ -55,19 +55,17 @@ def _random_delete(target_tokens, bos, eos, pad):
         .masked_fill_(target_cutoff, pad)
         .gather(1, target_rank.masked_fill_(target_cutoff, max_len).sort(1)[1])
     )
+    '''
     prev_target_tokens = prev_target_tokens[
         :, : prev_target_tokens.ne(pad).sum(1).max()
     ]
-
+    '''
     return prev_target_tokens
 
 def _expert_delete(prev_output_tokens, tgt_tokens, pad):
 
     word_del_targets = _get_del_targets(prev_output_tokens, tgt_tokens, pad)
     max_len = prev_output_tokens.size(1)
-    print("shape of word del targets: ", word_del_targets.size())
-    print("shape of prev_output_tokens: ", prev_output_tokens.size())
-    print("shape of tgt_tokens: ", tgt_tokens.size())
     reordering = new_arange(prev_output_tokens).masked_fill_(word_del_targets.bool(), max_len).sort(1)[1]
     del_tokens = prev_output_tokens.masked_fill(word_del_targets.bool(), pad).gather(1, reordering)
     return del_tokens
@@ -127,6 +125,11 @@ class LevenshteinTransformerModel(FairseqNATModel):
             help="the probability of using init tokens to learn the deletion policy",
         )
 
+        parser.add_argument(
+            "--within-batch", action="store_true",
+            help="the probability of using init tokens to learn the deletion policy",
+        )
+
 
 
     def __init__(self, args, encoder, decoder):
@@ -137,6 +140,8 @@ class LevenshteinTransformerModel(FairseqNATModel):
         model = super().build_model(args, task)
         model.dae_ratio = getattr(args, "dae_ratio", 0.5)
         model.alpha_ratio = getattr(args, "alpha_ratio", 0.5)
+        model.within_batch = getattr(args, "within_batch", False)
+        print("within batch is ", model.within_batch)
         return model
 
     @classmethod
@@ -157,6 +162,9 @@ class LevenshteinTransformerModel(FairseqNATModel):
         if prev_output_tokens.size(1) > tgt_tokens.size(1):
             pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
             tgt_tokens = torch.cat([tgt_tokens,pads],1)
+        if prev_output_tokens.size(1) < tgt_tokens.size(1):
+            pads = prev_output_tokens.new_full((prev_output_tokens.size(0), tgt_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
+            prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
         '''
         if src_tokens.size(1) > tgt_tokens.size(1):
             pads = tgt_tokens.new_full((tgt_tokens.size(0),src_tokens.size(1) - tgt_tokens.size(1)),self.pad)
@@ -165,10 +173,21 @@ class LevenshteinTransformerModel(FairseqNATModel):
             pads = src_tokens.new_full((src_tokens.size(0), tgt_tokens.size(1) - src_tokens.size(1)),self.pad)
             src_tokens = torch.cat([src_tokens,pads],1)
         '''
-        if random.uniform(0,1) < self.dae_ratio:
-            y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
-        else:
+
+        B, T = tgt_tokens.size()
+        if self.within_batch:
+            corrupted = (
+                            torch.rand(size=(B,), device=tgt_tokens.device)
+                            < self.dae_ratio
+                        )
+            noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
             y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+            y_ins[corrupted] = noisy_target[corrupted]
+        else:
+            if random.uniform(0,1) < self.dae_ratio:
+                y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
+            else:
+                y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
 
         # generate training labels for insertion
         masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
@@ -202,13 +221,23 @@ class LevenshteinTransformerModel(FairseqNATModel):
         )
 
         # generate training labels for deletion
-        if prev_output_tokens.size(1) > 2:
-            if random.uniform(0,1) < self.alpha_ratio:
-                y_del = prev_output_tokens
+        if self.within_batch:
+            y_del = word_predictions
+            init_seq = (
+                            torch.rand(size=(B,), device=tgt_tokens.device)
+                            < self.alpha_ratio
+                        )
+            y_del[init_seq] = prev_output_tokens[init_seq]
+        else:
+            if prev_output_tokens.size(1) > 2:
+                if random.uniform(0,1) < self.alpha_ratio:
+                    y_del = prev_output_tokens
+                else:
+                    y_del = word_predictions
             else:
                 y_del = word_predictions
-        else:
-            y_del = word_predictions
+
+
 
         word_del_targets = _get_del_targets(y_del, tgt_tokens, self.pad)
         word_del_out, _ = self.decoder.forward_word_del(
@@ -479,6 +508,7 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         self.unk = dictionary.unk()
         self.eos = dictionary.eos()
         self.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
+        #changed 256 to 100 however it seems that there was a sample needed more than that
         self.embed_mask_ins = Embedding(256, self.output_embed_dim * 2, None)
         self.embed_word_del = Embedding(2, self.output_embed_dim, None)
 

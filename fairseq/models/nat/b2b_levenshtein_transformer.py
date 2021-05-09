@@ -29,10 +29,10 @@ from .levenshtein_utils import (
 
 def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict):
 
-    embed_ln = re.compile("LayerNorm\.(weight|bias)")
-    self_attn = re.compile(r"layer\.(\d+)\.+attention.+((q)uery|(k)ey|(v)alue|(out)put\.dense|(output)\.LayerNorm)\.(weight|bias)")
+    embed_ln = re.compile("LayerNorm\.(gamma|beta)")
+    self_attn = re.compile(r"layer\.(\d+)\.+attention.+((q)uery|(k)ey|(v)alue|(out)put\.dense|(output)\.LayerNorm)\.(weight|bias|gamma|beta)")
     ffns = re.compile(r"layer\.(\d+)\.(intermediate|output)\.dense\.(weight|bias)")
-    ffns_ln_p = re.compile(r"layer\.(\d+)\.output\.LayerNorm\.(weight|bias)")
+    ffns_ln_p = re.compile(r"layer\.(\d+)\.output\.LayerNorm\.(gamma|beta)")
 
 
     for key in pretrained_state_dict.keys():
@@ -46,7 +46,11 @@ def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict
                 new_key = None
             else:
                 fs_embed_ln = "layernorm_embedding.{}"
-                new_key = fs_embed_ln.format(embed_ln.search(key).group(1))
+                suff = embed_ln.search(key).group(1)
+                if suff == "gamma":
+                    new_key = fs_embed_ln.format("weight")
+                else:
+                    new_key = fs_embed_ln.format("bias")
         elif "attention" in key:
             # print(k)
             groups = self_attn.search(key).groups()
@@ -66,8 +70,12 @@ def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict
                 new_key = fs_self_attn.format(groups[0], groups[5], groups[-1])
             else:
                 # print(fs_self_attn_ln.format(groups[0], groups[-1]))
-                new_key = fs_self_attn_ln.format(groups[0], groups[-1])
-        elif "dense" in key and "pooler" not in key:
+                if groups[-1] == 'gamma':
+                    new_key = fs_self_attn_ln.format(groups[0], "weight")
+                else:
+                    new_key = fs_self_attn_ln.format(groups[0], "bias")
+
+        elif "dense" in key and "pooler" not in key and "cls" not in key:
             groups = ffns.search(key).groups()
             # print(groups)
             ffns_f1 = "layers.{}.fc1.{}"
@@ -78,13 +86,17 @@ def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict
             else:
                 # print(ffns_f2.format(groups[0], groups[-1]))
                 new_key = ffns_f2.format(groups[0], groups[-1])
-        elif "LayerNorm" in key:
+
+        elif "LayerNorm" in key and "cls" not in key:
             # print(key)
             groups = ffns_ln_p.search(key).groups()
             ffns_ln = "layers.{}.final_layer_norm.{}"
             # print(groups)
             # print(ffns_ln.format(groups[0], groups[-1]))
-            new_key = ffns_ln.format(groups[0], groups[-1])
+            if groups[-1] == "gamma":
+                new_key = ffns_ln.format(groups[0], "weight")
+            else:
+                new_key = ffns_ln.format(groups[0], "bias")
 
         else:
             new_key = None
@@ -93,6 +105,7 @@ def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict
             # print(model[key].shape)
             # print(new_key, key)
             # print(state_dict[new_key].shape, pretrained_state_dict[key].shape)
+            #print(key,new_key)
             assert new_key in state_dict, (
                 "{} Transformer encoder / decoder "
                 "state_dict does not contain {}. Cannot "
@@ -103,8 +116,9 @@ def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict
                 )
 
             if new_key == "embed_tokens.weight":
-                size = pretrained_state_dict[key].size(0)
-                state_dict[new_key][:size] = pretrained_state_dict[key]
+                state_dict[new_key][4:] = pretrained_state_dict[key]
+            elif new_key == "embed_positions.weight":
+                state_dict[new_key][2:] = pretrained_state_dict[key]
             else:
                 assert state_dict[new_key].shape == pretrained_state_dict[key].shape
                 state_dict[new_key] = pretrained_state_dict[key]
@@ -121,7 +135,7 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
 
     @staticmethod
     def add_args(parser):
-        FairseqNATModel.add_args(parser)
+        LevenshteinTransformerModel.add_args(parser)
 
 
         parser.add_argument(
@@ -138,23 +152,22 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
 
 
     def __init__(self, args, encoder, decoder):
-        print("init ca with sa is: ", getattr(args, "init_CA_with_SA"))
-        super().__init__(args, encoder, decoder)
-        pretrained_bert = torch.load(getattr(args, "bert_checkpoint"))
 
-        loaded_state_dict = upgrade_state_dict_with_pretrained_weights(
-                encoder.state_dict(),
-                pretrained_bert,
-            )
+        super().__init__(args, encoder, decoder)
+        self.bos = decoder.bos
+        self.eos = decoder.eos
+        self.unk = decoder.unk
+        pretrained_bert = torch.load(getattr(args, "bert_checkpoint"))
+        loaded_state_dict = upgrade_state_dict_with_pretrained_weights(encoder.state_dict(),pretrained_bert)
         encoder.load_state_dict(loaded_state_dict, strict=True)
         decoder_state_dict = decoder.state_dict()
         for k in decoder_state_dict.keys():
             if k not in loaded_state_dict:
-                loaded_state_dict[k] = decoder_state_dict[k]
+                if 'encoder_attn' in k and getattr(args, "init_CA_with_SA"):
+                    loaded_state_dict[k] = loaded_state_dict[k.replace('encoder_attn', 'self_attn')]
+                else:
+                    loaded_state_dict[k] = decoder_state_dict[k]
         decoder.load_state_dict(loaded_state_dict, strict=True)
-
-        decoder_state_dict = decoder.state_dict()
-
 
 
 
@@ -501,9 +514,12 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
             args, dictionary, embed_tokens, no_encoder_attn=no_encoder_attn
         )
         self.dictionary = dictionary
-        self.bos = dictionary.bos()
-        self.unk = dictionary.unk()
-        self.eos = dictionary.eos()
+        #self.bos = dictionary.bos()
+        #self.unk = dictionary.unk()
+        #self.eos = dictionary.eos()
+        self.bos = dictionary.index('[CLS]')
+        self.eos = dictionary.index('[SEP]')
+        self.unk = dictionary.index('[MASK]')
         self.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
         self.embed_mask_ins = Embedding(256, self.output_embed_dim * 2, None)
         self.embed_word_del = Embedding(2, self.output_embed_dim, None)
@@ -656,11 +672,12 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
 @register_model_architecture("b2b_levenshtein_transformer", "b2b_levenshtein_transformer")
 def levenshtein_base_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
+    args.layernorm_embedding = getattr(args, "layernorm_embedding", True)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 3072)
     args.encoder_layers = getattr(args, "encoder_layers", 12)
     args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 12)
-    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
     args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
 
     args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
@@ -671,9 +688,9 @@ def levenshtein_base_architecture(args):
     args.decoder_layers = getattr(args, "decoder_layers", 12)
     args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 12)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
+    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
 
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
 
     args.activation_fn = getattr(args, "activation_fn", "gelu")
@@ -688,7 +705,7 @@ def levenshtein_base_architecture(args):
         args, "no_token_positional_embeddings", False
     )
     args.adaptive_input = getattr(args, "adaptive_input", False)
-    args.apply_bert_init = getattr(args, "apply_bert_init", False)
+    args.apply_bert_init = getattr(args, "apply_bert_init", True)
 
     args.decoder_output_dim = getattr(
         args, "decoder_output_dim", args.decoder_embed_dim

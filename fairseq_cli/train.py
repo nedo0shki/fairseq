@@ -134,7 +134,8 @@ def main(cfg: FairseqConfig) -> None:
     train_meter = meters.StopwatchMeter()
     train_meter.start()
     while epoch_itr.next_epoch_idx <= max_epoch:
-
+        print("calculating sari")
+        SARI = SARI_validate(cfg, trainer, task, epoch_itr)
         if lr <= cfg.optimization.stop_min_lr:
             logger.info(
                 f"stopping training because current learning rate ({lr}) is smaller "
@@ -240,7 +241,9 @@ def train(
     valid_subsets = cfg.dataset.valid_subset.split(",")
     should_stop = False
     num_updates = trainer.get_num_updates()
-
+    #valid_losses, should_stop = validate_and_save(
+    #    cfg, trainer, task, epoch_itr, valid_subsets, 1
+    #)
     for i, samples in enumerate(progress):
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
@@ -430,7 +433,6 @@ def SARI_validate(
     trainer: Trainer,
     task: tasks.FairseqTask,
     epoch_itr,
-    subsets: List[str],
 ) -> List[Optional[float]]:
 
     import ast
@@ -518,8 +520,9 @@ def SARI_validate(
     print("starting post processing")
     sys.path.insert(1, '/home/nshokran/utils')
     from utils import merge_word_pieces, read_lines
-    #if cfg.dataset.proc_type == 'bpe':
-    #    merge_word_pieces(pred_filepath,1)
+    '''
+    if cfg.dataset.proc_type == 'bpe':
+        merge_word_pieces(pred_filepath,1)
     if cfg.dataset.proc_type == 'pg':
         cmd = "python /home/nshokran/baselines/seq2seq/fairseq/examples/pointer_generator/postprocess.py --source " + cfg.dataset.raw_src_valid + " --target " + pred_filepath + " --target-out " + pred_filepath + ".proc"
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
@@ -530,6 +533,7 @@ def SARI_validate(
         cmd = "rm " + pred_filepath + ".proc"
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
         p.wait()
+    '''
     print("start reading files")
     pred_sents = read_lines(pred_filepath)
     src_sents = read_lines(cfg.dataset.raw_src_valid)
@@ -556,7 +560,8 @@ def SARI_validate(
     '''
     print("SARI score = ",SARI_score)
     writer = SummaryWriter(os.path.join(cfg.common.tensorboard_logdir, 'SARI'))
-    writer.add_scalar('SARI', SARI_score, trainer.get_num_updates())
+    writer.add_scalar('SARI', SARI_score, epoch_itr.epoch)
+    #writer.add_scalar('SARI', SARI_score, trainer.get_num_updates())
     return[SARI_score]
 
 
