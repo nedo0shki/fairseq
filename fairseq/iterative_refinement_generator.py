@@ -32,6 +32,8 @@ class IterativeRefinementGenerator(object):
         retain_history=False,
         reranking=False,
         init_tokens=None,
+        oracle_delete=False,
+        oracle_insertion=False,
     ):
         """
         Generates translations based on iterative refinement.
@@ -60,6 +62,8 @@ class IterativeRefinementGenerator(object):
         self.adaptive = adaptive
         self.models = models
         self.init_tokens = init_tokens
+        self.oracle_del = oracle_delete
+        self.oracle_ins = oracle_insertion
 
     def generate_batched_itr(
         self,
@@ -147,7 +151,6 @@ class IterativeRefinementGenerator(object):
         prev_decoder_out = model.initialize_output_tokens(
             encoder_out, src_tokens, init_tokens=init_tokens
         )
-
         if self.beam_size > 1:
             assert (
                 model.allow_length_beam
@@ -208,20 +211,25 @@ class IterativeRefinementGenerator(object):
                 "hypo_attn": hypo_attn,
                 "alignment": alignment,
             }
-
+        if 'target' in sample:
+            tgt_tokens = sample["target"]
+        else:
+            tgt_tokens = None
         for step in range(self.max_iter + 1):
 
             decoder_options = {
                 "eos_penalty": self.eos_penalty,
                 "max_ratio": self.max_ratio,
                 "decoding_format": self.decoding_format,
+                "oracle_del": self.oracle_del,
+                "oracle_ins": self.oracle_ins,
             }
             prev_decoder_out = prev_decoder_out._replace(
                 step=step, max_step=self.max_iter + 1,
             )
 
             decoder_out = model.forward_decoder(
-                prev_decoder_out, encoder_out, **decoder_options
+                prev_decoder_out, encoder_out, tgt_tokens, **decoder_options
             )
 
             if self.adaptive:
@@ -295,6 +303,8 @@ class IterativeRefinementGenerator(object):
             encoder_out = model.encoder.reorder_encoder_out(
                 encoder_out, not_terminated.nonzero().squeeze()
             )
+            if tgt_tokens is not None:    
+                tgt_tokens = tgt_tokens[not_terminated]
             sent_idxs = sent_idxs[not_terminated]
             prev_output_tokens = prev_decoder_out.output_tokens.clone()
 

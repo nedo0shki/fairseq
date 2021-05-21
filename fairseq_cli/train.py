@@ -134,8 +134,7 @@ def main(cfg: FairseqConfig) -> None:
     train_meter = meters.StopwatchMeter()
     train_meter.start()
     while epoch_itr.next_epoch_idx <= max_epoch:
-        print("calculating sari")
-        SARI = SARI_validate(cfg, trainer, task, epoch_itr)
+
         if lr <= cfg.optimization.stop_min_lr:
             logger.info(
                 f"stopping training because current learning rate ({lr}) is smaller "
@@ -143,9 +142,10 @@ def main(cfg: FairseqConfig) -> None:
                 f"(--stop-min-lr={cfg.optimization.stop_min_lr})"
             )
             break
-
         # train for one epoch
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
+        print("calculating sari")
+        SARI = SARI_validate(cfg, trainer, task, epoch_itr)
         if should_stop:
             break
 

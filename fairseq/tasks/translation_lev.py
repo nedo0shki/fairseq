@@ -23,12 +23,22 @@ class TranslationLevenshteinConfig(TranslationConfig):
             "help": "type of noise"
         },
     )
+
     init_tokens: ChoiceEnum(["empty", "src"]) = field(
         default="empty",
         metadata={
             "help": "type of output initialization"
         },
     )
+
+    oracle_del: bool = field(
+        default=False, metadata={"help": "use oracle delete operations in generation"}
+    )
+
+    oracle_ins: bool = field(
+        default=False, metadata={"help": "use oracle insertion operations in generation"}
+    )
+
 
 
 
@@ -157,8 +167,6 @@ class TranslationLevenshteinTask(TranslationTask):
     def build_generator(self, models, args, **unused):
         # add models input to match the API for SequenceGenerator
         from fairseq.iterative_refinement_generator import IterativeRefinementGenerator
-        print(args)
-        print("init_token is ", self.cfg.init_tokens)
         return IterativeRefinementGenerator(
             self.target_dictionary,
             eos_penalty=getattr(args, "iter_decode_eos_penalty", 0.0),
@@ -168,7 +176,9 @@ class TranslationLevenshteinTask(TranslationTask):
             decoding_format=getattr(args, "decoding_format", None),
             adaptive=not getattr(args, "iter_decode_force_max_iter", False),
             retain_history=getattr(args, "retain_iter_history", False),
-            init_tokens=self.cfg.init_tokens
+            init_tokens=self.cfg.init_tokens,
+            oracle_delete=self.cfg.oracle_del,
+            oracle_insertion=self.cfg.oracle_ins,
         )
 
     def inference_step(
@@ -194,6 +204,14 @@ class TranslationLevenshteinTask(TranslationTask):
         self, sample, model, criterion, optimizer, update_num, ignore_grad=False
     ):
         model.train()
+
+        if update_num <= 23000:
+            sample['train_step'] = 1
+        elif update_num <= 50000:
+            sample['train_step'] = 2
+        else:
+            sample['train_step'] = 3
+
         if self.cfg.init_tokens is not None:
             src_tokens = sample["net_input"]["src_tokens"]
             if self.cfg.init_tokens == 'src':
@@ -218,6 +236,7 @@ class TranslationLevenshteinTask(TranslationTask):
 
     def valid_step(self, sample, model, criterion):
         model.eval()
+
         with torch.no_grad():
             if self.cfg.init_tokens is not None:
                 src_tokens = sample["net_input"]["src_tokens"]

@@ -72,6 +72,8 @@ def _expert_delete(prev_output_tokens, tgt_tokens, pad):
 
 
 
+
+
 @register_model("levenshtein_transformer")
 class LevenshteinTransformerModel(FairseqNATModel):
     @property
@@ -127,9 +129,29 @@ class LevenshteinTransformerModel(FairseqNATModel):
 
         parser.add_argument(
             "--within-batch", action="store_true",
-            help="the probability of using init tokens to learn the deletion policy",
+            help="mixed dae and actual distribution within batch",
         )
 
+        parser.add_argument(
+            "--train-step",
+            type=int,
+            help="number of refinement iterations during training",
+        )
+
+        parser.add_argument(
+            "--dae-for-first-iter", action="store_true",
+            help="use dae just in the first step of training steps",
+        )
+
+        parser.add_argument(
+            "--roll-out", action="store_true",
+            help="aggregate roll-out data during training",
+        )
+
+        parser.add_argument(
+            "--model-del", action="store_true",
+            help="use model delete instead of the oracle to learn the insertion policy",
+        )
 
 
     def __init__(self, args, encoder, decoder):
@@ -141,7 +163,11 @@ class LevenshteinTransformerModel(FairseqNATModel):
         model.dae_ratio = getattr(args, "dae_ratio", 0.5)
         model.alpha_ratio = getattr(args, "alpha_ratio", 0.5)
         model.within_batch = getattr(args, "within_batch", False)
-        print("within batch is ", model.within_batch)
+        model.train_step = getattr(args, "train_step", 1)
+        model.dae_for_first_iter = getattr(args, "dae_for_first_iter", False)
+        model.random_policy = getattr(args, "random_policy", "rnd-del")
+        model.model_del = getattr(args, "model_del", False)
+        model.roll_out = getattr(args, "roll_out", False)
         return model
 
     @classmethod
@@ -152,37 +178,93 @@ class LevenshteinTransformerModel(FairseqNATModel):
         return decoder
 
     def forward(
-        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, **kwargs
+        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, train_step, **kwargs
     ):
 
         assert tgt_tokens is not None, "forward function only supports training."
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
 
-        # fill pad to src_tokens or tgt_tokens to have a similar size
+        B, T = tgt_tokens.size()
+        V = len(self.decoder.dictionary)
+
+        if train_step is None:
+            train_step = 1
+
+        if self.roll_out:
+            if train_step > 1:
+                init_tokens_list = []
+                init_tokens_list.append(prev_output_tokens)
+                for t in range(train_step - 1):
+                    output_scores = init_tokens_list[t].new_zeros(
+                        *init_tokens_list[t].size()
+                    ).type_as(encoder_out["encoder_out"][0])
+                    decoder_out = DecoderOut(
+                        output_tokens=init_tokens_list[t],
+                        output_scores=output_scores,
+                        attn=None,
+                        step=0,
+                        max_step=0,
+                        history=None
+                    )
+                    decoder_out = self.forward_decoder(decoder_out, encoder_out, None, max_ratio=2)
+                    init_tokens_list.append(decoder_out.output_tokens)
+                inits_max_len = max([init_tokens.size(1) for init_tokens in init_tokens_list])
+                print(inits_max_len)
+                for i in range(len(init_tokens_list)):
+                    print("before: ",init_tokens_list[i].size())
+                    if init_tokens_list[i].size(1) < inits_max_len:
+                        pads = init_tokens_list[i].new_full((init_tokens_list[i].size(0),inits_max_len - init_tokens_list[i].size(1)),self.pad)
+                        init_tokens_list[i] = torch.cat([init_tokens_list[i],pads],1)
+                    print("after:", init_tokens_list[i].size())
+                prev_output_tokens = init_tokens_list[0]
+                rand_ind = torch.rand(size=(B,), device=tgt_tokens.device)
+                for t in range(train_step):
+                    curr_ind = (rand_ind > t/train_step) & (rand_ind <= (t+1)/train_step)
+                    prev_output_tokens[curr_ind] = init_tokens_list[t][curr_ind]
+
         if prev_output_tokens.size(1) > tgt_tokens.size(1):
             pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
             tgt_tokens = torch.cat([tgt_tokens,pads],1)
         if prev_output_tokens.size(1) < tgt_tokens.size(1):
             pads = prev_output_tokens.new_full((prev_output_tokens.size(0), tgt_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
             prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
-        '''
-        if src_tokens.size(1) > tgt_tokens.size(1):
-            pads = tgt_tokens.new_full((tgt_tokens.size(0),src_tokens.size(1) - tgt_tokens.size(1)),self.pad)
-            tgt_tokens = torch.cat([tgt_tokens,pads],1)
-        if tgt_tokens.size(1) > src_tokens.size(1):
-            pads = src_tokens.new_full((src_tokens.size(0), tgt_tokens.size(1) - src_tokens.size(1)),self.pad)
-            src_tokens = torch.cat([src_tokens,pads],1)
-        '''
 
-        B, T = tgt_tokens.size()
+
         if self.within_batch:
             corrupted = (
                             torch.rand(size=(B,), device=tgt_tokens.device)
                             < self.dae_ratio
                         )
-            noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
-            y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+            if self.random_policy == "rnd-del":
+                noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
+            else:
+                noisy_target = _sequential_poisoning(prev_output_tokens, V, 0.33, self.bos, self.eos, self.pad)
+                noisy_target = _expert_delete(noisy_target, tgt_tokens, self.pad)
+
+            if self.model_del:
+
+                word_del_score, word_del_attn = self.decoder.forward_word_del(
+                    normalize=True,
+                    prev_output_tokens=prev_output_tokens,
+                    encoder_out=encoder_out,
+                )
+
+                word_del_pred = word_del_score.max(-1)[1].bool()
+
+                y_ins, _, _ = _apply_del_words(
+                    prev_output_tokens,
+                    None,
+                    None,
+                    word_del_pred,
+                    self.pad,
+                    self.bos,
+                    self.eos,
+                )
+            else:
+                y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+
             y_ins[corrupted] = noisy_target[corrupted]
+
         else:
             if random.uniform(0,1) < self.dae_ratio:
                 y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
@@ -190,17 +272,18 @@ class LevenshteinTransformerModel(FairseqNATModel):
                 y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
 
         # generate training labels for insertion
-        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
+        masked_tgt_masks, masked_tgt_tokens, mask_ins_target = _get_ins_targets(
             y_ins, tgt_tokens, self.pad, self.unk
         )
-        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
-        mask_ins_masks = y_ins[:, 1:].ne(self.pad)
+        mask_ins_target = mask_ins_target.clamp(min=0, max=255)  # for safe prediction
+        mask_ins_mask = y_ins[:, 1:].ne(self.pad)
 
         mask_ins_out, _ = self.decoder.forward_mask_ins(
             normalize=False,
             prev_output_tokens=y_ins,
             encoder_out=encoder_out,
         )
+
 
         word_ins_out, _ = self.decoder.forward_word_ins(
             normalize=False,
@@ -239,112 +322,19 @@ class LevenshteinTransformerModel(FairseqNATModel):
 
 
 
-        word_del_targets = _get_del_targets(y_del, tgt_tokens, self.pad)
+        word_del_target = _get_del_targets(y_del, tgt_tokens, self.pad)
         word_del_out, _ = self.decoder.forward_word_del(
             normalize=False,
             prev_output_tokens=y_del,
             encoder_out=encoder_out,
         )
-        word_del_masks = y_del.ne(self.pad)
-        '''
-        print("source tokens: ", src_tokens[0:2,:])
-        print("target tokens: ", tgt_tokens[0:2,:])
-        print("y_ins: ", y_ins[0:2,:])
-        print("mask ins: ", mask_ins_targets[0:2,:])
-        print("masked target tokens: ", masked_tgt_tokens[0:2,:])
-        print("y_del: ", y_del[0:2,:])
-        print("word del targets: ", word_del_targets[0:2,:])
-        '''
+        word_del_mask = y_del.ne(self.pad)
 
-
-        '''
-        #training labels to delete from the source
-        word_del_targets = _get_del_targets(src_tokens, tgt_tokens, self.pad)
-        word_del_out, _ = self.decoder.forward_word_del(
-            normalize=False,
-            prev_output_tokens=src_tokens,
-            encoder_out=encoder_out,
-        )
-
-        word_del_masks = src_tokens.ne(self.pad)
-        max_len = src_tokens.size(1)
-        reordering = new_arange(src_tokens).masked_fill_(word_del_targets.bool(), max_len).sort(1)[1]
-        del_src_tokens = src_tokens.masked_fill(word_del_targets.bool(), self.pad).gather(1, reordering)
-
-
-        #training labels to insert placeholders
-        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
-            del_src_tokens, tgt_tokens, self.pad, self.unk
-        )
-        mask_ins_masks = del_src_tokens[:, 1:].ne(self.pad)
-
-        mask_ins_out, _ = self.decoder.forward_mask_ins(
-            normalize=False,
-            prev_output_tokens=del_src_tokens,
-            encoder_out=encoder_out,
-        )
-        # learned policy vs expert policy for placeholders
-        word_ins_out, _ = self.decoder.forward_word_ins(
-            normalize=False,
-            prev_output_tokens=masked_tgt_tokens,
-            encoder_out=encoder_out,
-        )
-
-
-        # fill pad when initiaze with mt that is longer than pe
-        if prev_output_tokens.size(1) > tgt_tokens.size(1):
-            pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
-            tgt_tokens = torch.cat([tgt_tokens,pads],1)
-
-
-        # encoding
-        encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
-
-        # generate training labels for insertion
-        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
-            prev_output_tokens, tgt_tokens, self.pad, self.unk
-        )
-        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
-        mask_ins_masks = prev_output_tokens[:, 1:].ne(self.pad)
-
-        mask_ins_out, _ = self.decoder.forward_mask_ins(
-            normalize=False,
-            prev_output_tokens=prev_output_tokens,
-            encoder_out=encoder_out,
-        )
-
-        word_ins_out, _ = self.decoder.forward_word_ins(
-            normalize=False,
-            prev_output_tokens=masked_tgt_tokens,
-            encoder_out=encoder_out,
-        )
-
-        # make online prediction
-        if self.decoder.sampling_for_deletion:
-            word_predictions = torch.multinomial(
-                F.softmax(word_ins_out, -1).view(-1, word_ins_out.size(-1)), 1
-            ).view(word_ins_out.size(0), -1)
-        else:
-            word_predictions = F.log_softmax(word_ins_out, dim=-1).max(2)[1]
-
-        word_predictions.masked_scatter_(
-            ~masked_tgt_masks, tgt_tokens[~masked_tgt_masks]
-        )
-
-        # generate training labels for deletion
-        word_del_targets = _get_del_targets(word_predictions, tgt_tokens, self.pad)
-        word_del_out, _ = self.decoder.forward_word_del(
-            normalize=False,
-            prev_output_tokens=word_predictions,
-            encoder_out=encoder_out,
-        )
-        word_del_masks = word_predictions.ne(self.pad)
-        '''
         return {
             "mask_ins": {
                 "out": mask_ins_out,
-                "tgt": mask_ins_targets,
-                "mask": mask_ins_masks,
+                "tgt": mask_ins_target,
+                "mask": mask_ins_mask,
                 "ls": 0.01,
             },
             "word_ins": {
@@ -356,17 +346,17 @@ class LevenshteinTransformerModel(FairseqNATModel):
             },
             "word_del": {
                 "out": word_del_out,
-                "tgt": word_del_targets,
-                "mask": word_del_masks,
+                "tgt": word_del_target,
+                "mask": word_del_mask,
             },
 
         }
 
 
     def forward_decoder(
-        self, decoder_out, encoder_out, eos_penalty=0.0, max_ratio=None, **kwargs
+        self, decoder_out, encoder_out, target_tokens, eos_penalty=0.0, max_ratio=None,
+        oracle_del=False, oracle_ins=False, **kwargs
     ):
-
         output_tokens = decoder_out.output_tokens
         output_scores = decoder_out.output_scores
         attn = decoder_out.attn
@@ -382,17 +372,23 @@ class LevenshteinTransformerModel(FairseqNATModel):
             else:
                 src_lens = (~encoder_out["encoder_padding_mask"][0]).sum(1)
             max_lens = (src_lens * max_ratio).clamp(min=10).long()
-
         # delete words
         # do not delete tokens if it is <s> </s>
         can_del_word = output_tokens.ne(self.pad).sum(1) > 2
         if can_del_word.sum() != 0:  # we cannot delete, skip
-            word_del_score, word_del_attn = self.decoder.forward_word_del(
-                normalize=True,
-                prev_output_tokens=_skip(output_tokens, can_del_word),
-                encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
-            )
-            word_del_pred = word_del_score.max(-1)[1].bool()
+            if oracle_del:
+                word_del_pred = _get_del_targets(
+                    _skip(output_tokens, can_del_word),
+                    _skip(target_tokens, can_del_word), self.pad).bool()
+                word_del_attn = None
+                word_del_score = None
+            else:
+                word_del_score, word_del_attn = self.decoder.forward_word_del(
+                    normalize=True,
+                    prev_output_tokens=_skip(output_tokens, can_del_word),
+                    encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
+                )
+                word_del_pred = word_del_score.max(-1)[1].bool()
 
             _tokens, _scores, _attn = _apply_del_words(
                 output_tokens[can_del_word],
