@@ -411,6 +411,13 @@ class DatasetConfig(FairseqDataclass):
         }
     )
 
+    raw_src_train: str = field(
+        default="",
+        metadata={
+            "help": "path of src train dataset for calculation of SARI score"
+        }
+    )
+
     raw_src_valid: str = field(
         default="",
         metadata={
@@ -669,6 +676,12 @@ class FairseqBMUFConfig(FairseqDataclass):
 
 @dataclass
 class GenerationConfig(FairseqDataclass):
+
+    p_gen_file: str = field(
+        default="",
+        metadata={"help": "file to save probability of generations into"},
+    )
+
     beam: int = field(
         default=5,
         metadata={"help": "beam size"},

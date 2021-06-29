@@ -38,7 +38,7 @@ logging.basicConfig(
 logger = logging.getLogger("fairseq_cli.interactive")
 
 
-Batch = namedtuple("Batch", "ids src_tokens src_lengths constraints")
+Batch = namedtuple("Batch", "ids src_tokens src_lengths constraints decoder_input")
 Translation = namedtuple("Translation", "src_str hypos pos_scores alignments")
 
 
@@ -105,11 +105,15 @@ def make_batches(lines, cfg, task, max_positions, encode_fn):
         src_tokens = batch["net_input"]["src_tokens"]
         src_lengths = batch["net_input"]["src_lengths"]
         constraints = batch.get("constraints", None)
+        decoder_input = None
+        if 'decoder_input' in batch:
+            decoder_input = batch["decoder_input"]
         yield Batch(
             ids=ids,
             src_tokens=src_tokens,
             src_lengths=src_lengths,
             constraints=constraints,
+            decoder_input=decoder_input,
         )
 
 
@@ -218,17 +222,22 @@ def main(cfg: FairseqConfig):
             src_tokens = batch.src_tokens
             src_lengths = batch.src_lengths
             constraints = batch.constraints
+            decoder_input = batch.decoder_input
             if use_cuda:
                 src_tokens = src_tokens.cuda()
                 src_lengths = src_lengths.cuda()
                 if constraints is not None:
                     constraints = constraints.cuda()
+                if decoder_input is not None:
+                    for d in range(len(decoder_input)):
+                        decoder_input[d] = decoder_input[d].cuda()
 
             sample = {
                 "net_input": {
                     "src_tokens": src_tokens,
                     "src_lengths": src_lengths,
                 },
+                'decoder_input' : decoder_input,
             }
             translate_start_time = time.time()
             translations = task.inference_step(

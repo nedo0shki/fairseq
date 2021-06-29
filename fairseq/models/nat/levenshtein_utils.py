@@ -213,7 +213,15 @@ def _apply_del_words(
     max_len = in_tokens.size(1)
     word_del_pred.masked_fill_(~in_masks, 1)
     word_del_pred.masked_fill_(bos_eos_masks, 0)
-
+    '''
+    same_token_mask = token_ids.new_zeros(*token_ids.size())
+    for sent_num,item in enumerate(word_del_pred):
+        for i,d in enumerate(item):
+            if d == True:
+                token_id = token_ids[sent_num,i]
+                same_token_mask[sent_num] = torch.logical_or(same_token_mask[sent_num], (token_ids[sent_num] == token_id))
+    word_del_pred.masked_fill_(same_token_mask, 1)
+    '''
     reordering = new_arange(in_tokens).masked_fill_(word_del_pred, max_len).sort(1)[1]
 
     out_tokens = in_tokens.masked_fill(word_del_pred, padding_idx).gather(1, reordering)

@@ -14,6 +14,7 @@ import math
 import os
 import sys
 import subprocess
+import re
 from typing import Dict, Optional, Any, List, Tuple, Callable
 
 import numpy as np
@@ -43,6 +44,7 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("fairseq_cli.train")
+
 
 
 def main(cfg: FairseqConfig) -> None:
@@ -79,7 +81,6 @@ def main(cfg: FairseqConfig) -> None:
 
     # Build model and criterion
     model = task.build_model(cfg.model)
-    torch.save(model.state_dict(), "/home/nshokran/baselines/temp_bert_levt.bin")
     criterion = task.build_criterion(cfg.criterion)
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
@@ -129,6 +130,13 @@ def main(cfg: FairseqConfig) -> None:
         disable_iterator_cache=task.has_sharded_data("train"),
     )
 
+    if os.path.exists(os.path.join(cfg.task.data, "intermediate_train_data")) and task.__class__.__name__ == "translation_lev":
+        for intermediate_file in os.listdir(os.path.join(cfg.task.data, "intermediate_train_data")):
+            step = get_trailing_number(intermediate_file.split(".")[0])
+            intermediate_file_path = os.path.join(cfg.task.data, "intermediate_train_data",intermediate_file)
+            task.update_dataset(intermediate_file_path,step)
+
+
     max_epoch = cfg.optimization.max_epoch or math.inf
     lr = trainer.get_lr()
     train_meter = meters.StopwatchMeter()
@@ -143,11 +151,13 @@ def main(cfg: FairseqConfig) -> None:
             )
             break
         # train for one epoch
+        #SARI = SARI_validate(cfg, trainer, task, epoch_itr)
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
         print("calculating sari")
-        SARI = SARI_validate(cfg, trainer, task, epoch_itr)
+        #SARI = SARI_validate(cfg, trainer, task, epoch_itr)
         if should_stop:
             break
+
 
         # only use first validation loss to update the learning rate
         lr = trainer.lr_step(epoch_itr.epoch, valid_losses[0])
@@ -165,6 +175,7 @@ def main(cfg: FairseqConfig) -> None:
 
 def should_stop_early(cfg: DictConfig, valid_loss: float) -> bool:
     # skip check if no validation was done in the current epoch
+    #print("valid loss is ", valid_loss)
     if valid_loss is None:
         return False
     if cfg.checkpoint.patience <= 0:
@@ -259,7 +270,10 @@ def train(
                 # reset mid-epoch stats after each log interval
                 # the end-of-epoch stats will still be preserved
                 metrics.reset_meters("train_inner")
-
+        if num_updates == 300100:
+            logger.info("generating intermediate states")
+            step, inter_file_path = generate_intermediate_dataset(cfg, trainer, task, 1)
+            task.update_dataset(inter_file_path,step)
         end_of_epoch = not itr.has_next()
         valid_losses, should_stop = validate_and_save(
             cfg, trainer, task, epoch_itr, valid_subsets, end_of_epoch
@@ -299,6 +313,7 @@ def validate_and_save(
     valid_subsets: List[str],
     end_of_epoch: bool,
 ) -> Tuple[List[Optional[float]], bool]:
+
     num_updates = trainer.get_num_updates()
     max_update = cfg.optimization.max_update or math.inf
 
@@ -348,8 +363,10 @@ def validate_and_save(
     # Validate
     valid_losses = [None]
     if do_validate:
-        #print("I'm validating")
+        print("I'm validating based on valid set loss")
         valid_losses = validate(cfg, trainer, task, epoch_itr, valid_subsets)
+        print("I'm validating based on SARI score")
+        valid_losses = SARI_validate(cfg, trainer, task, epoch_itr)
 
     should_stop |= should_stop_early(cfg, valid_losses[0])
 
@@ -422,9 +439,102 @@ def validate(
         # log validation stats
         stats = get_valid_stats(cfg, trainer, agg.get_smoothed_values())
         progress.print(stats, tag=subset, step=trainer.get_num_updates())
-
         valid_losses.append(stats[cfg.checkpoint.best_checkpoint_metric])
+
     return valid_losses
+
+
+def generate_intermediate_dataset(
+    cfg: DictConfig,
+    trainer: Trainer,
+    task: tasks.FairseqTask,
+    step):
+
+    from fairseq_cli.interactive import buffered_read, make_batches
+
+    src_filepath = cfg.dataset.raw_src_train
+    pred_dir = os.path.join(cfg.task.data, "intermediate_train_data")
+    if not os.path.exists(pred_dir):
+        os.makedirs(pred_dir)
+    pred_filepath = os.path.join(pred_dir, "intermediate" + str(step) + ".out")
+    if not os.path.exists(pred_filepath):
+        logger.info("starting generation of decoder input version after {} steps".format(step))
+        parser = options.get_generation_parser(interactive=True)
+        gen_args = options.parse_args_and_arch(parser, input_args=['/home/nshokran/dummy_data', '--beam', '1'])
+        # Initialize generator
+        generator = task.build_generator([trainer.model],gen_args)
+        max_positions = utils.resolve_max_positions(
+            task.max_positions(),
+            trainer.get_model().max_positions(),
+        )
+        tokenizer = encoders.build_tokenizer(cfg.tokenizer)
+        bpe = encoders.build_bpe(cfg.bpe)
+
+        def encode_fn(x):
+            if tokenizer is not None:
+                x = tokenizer.encode(x)
+            if bpe is not None:
+                x = bpe.encode(x)
+            return x
+
+        def decode_fn(x):
+            if bpe is not None:
+                x = bpe.decode(x)
+            if tokenizer is not None:
+                x = tokenizer.decode(x)
+            return x
+
+        start_id = 0
+        print("starting translation")
+        with open(pred_filepath, 'w') as f:
+            for inputs in buffered_read(src_filepath, buffer_size=9999):
+                results = []
+                for batch in make_batches(inputs, cfg, task, max_positions, encode_fn):
+                    src_tokens = batch.src_tokens
+                    src_lengths = batch.src_lengths
+
+                    if torch.cuda.is_available() and not cfg.common.cpu:
+                        src_tokens = src_tokens.cuda()
+                        src_lengths = src_lengths.cuda()
+
+                    sample = {
+                        'net_input': {
+                            'src_tokens': src_tokens,
+                            'src_lengths': src_lengths,
+                        },
+                    }
+                    translations = task.inference_step(generator, [trainer.model], sample)
+                    for i, (id, hypos) in enumerate(zip(batch.ids.tolist(), translations)):
+                        src_tokens_i = utils.strip_pad(src_tokens[i], task.target_dictionary.pad())
+                        results.append((start_id + id, src_tokens_i, hypos))
+
+
+                for id_, src_tokens, hypos in sorted(results, key=lambda x: x[0]):
+                    if task.source_dictionary is not None:
+                        src_str = task.source_dictionary.string(src_tokens, cfg.common_eval.post_process)
+
+
+                    # Process top predictions
+                    # Process top predictions
+
+                    for hypo in hypos[:min(len(hypos), gen_args.nbest)]:
+
+                        hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
+                            hypo_tokens=hypo['tokens'].int().cpu(),
+                            src_str=src_str,
+                            alignment=hypo['alignment'].int().cpu() if hypo['alignment'] is not None else None,
+                            align_dict=None,
+                            tgt_dict=task.target_dictionary,
+                            remove_bpe=cfg.common_eval.post_process,
+                        )
+                        detok_hypo_str = decode_fn(hypo_str)
+                        f.write(f'{hypo_str}\n')
+
+                start_id += len(results)
+                print(str(start_id), " translated.")
+    else:
+        logger.info("decoder input version after {} steps already exist.".format(step))
+    return(step, pred_filepath)
 
 # based on ACCESS implementation
 
@@ -472,22 +582,28 @@ def SARI_validate(
     start_id = 0
     print("starting translation")
     with open(pred_filepath, 'w') as f:
-        for inputs in buffered_read(src_filepath, buffer_size=9999):
+        for inputs in buffered_read(src_filepath, buffer_size=500):
             results = []
             for batch in make_batches(inputs, cfg, task, max_positions, encode_fn):
                 src_tokens = batch.src_tokens
                 src_lengths = batch.src_lengths
-
+                decoder_input = batch.decoder_input
                 if torch.cuda.is_available() and not cfg.common.cpu:
                     src_tokens = src_tokens.cuda()
                     src_lengths = src_lengths.cuda()
+                    if decoder_input is not None:
+                        for d in range(len(decoder_input)):
+                            decoder_input[d] = decoder_input[d].cuda()
+
 
                 sample = {
                     'net_input': {
                         'src_tokens': src_tokens,
                         'src_lengths': src_lengths,
                     },
+                    'decoder_input' : decoder_input,
                 }
+
                 translations = task.inference_step(generator, [trainer.model], sample)
                 for i, (id, hypos) in enumerate(zip(batch.ids.tolist(), translations)):
                     src_tokens_i = utils.strip_pad(src_tokens[i], task.target_dictionary.pad())
@@ -564,6 +680,9 @@ def SARI_validate(
     #writer.add_scalar('SARI', SARI_score, trainer.get_num_updates())
     return[SARI_score]
 
+def get_trailing_number(s):
+    m = re.search(r'\d+$', s)
+    return int(m.group()) if m else None
 
 def get_valid_stats(
     cfg: DictConfig, trainer: Trainer, stats: Dict[str, Any]

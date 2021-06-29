@@ -4,13 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 import re
 import random
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fairseq.iterative_refinement_generator import DecoderOut
 from fairseq.models import register_model, register_model_architecture
-from fairseq.models.nat import FairseqNATDecoder, FairseqNATModel, ensemble_decoder, LevenshteinTransformerModel
-from fairseq.models.nat.levenshtein_transformer import _random_delete, _expert_delete
+from fairseq.models.nat import FairseqNATDecoder, FairseqNATModel, ensemble_decoder
 from fairseq.models.transformer import Embedding, TransformerDecoderLayer
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 from fairseq.utils import new_arange
@@ -26,170 +26,165 @@ from .levenshtein_utils import (
     _skip_encoder_out,
 )
 
-
-def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict, num_layers):
-
-    embed_ln = re.compile("LayerNorm\.(gamma|beta)")
-    self_attn = re.compile(r"layer\.(\d+)\.+attention.+((q)uery|(k)ey|(v)alue|(out)put\.dense|(output)\.LayerNorm)\.(weight|bias|gamma|beta)")
-    ffns = re.compile(r"layer\.(\d+)\.(intermediate|output)\.dense\.(weight|bias)")
-    ffns_ln_p = re.compile(r"layer\.(\d+)\.output\.LayerNorm\.(gamma|beta)")
-
-
-    for key in pretrained_state_dict.keys():
-        # print(key)
-        if "embeddings" in key:
-            if "word" in key:
-                new_key = "embed_tokens.weight"
-            elif "position" in key:
-                new_key = 'embed_positions.weight'
-            elif "type" in key:
-                new_key = None
-            else:
-                fs_embed_ln = "layernorm_embedding.{}"
-                suff = embed_ln.search(key).group(1)
-                if suff == "gamma":
-                    new_key = fs_embed_ln.format("weight")
+def summary(predictions, ground_truths):
+    summary_df = []
+    for prediction, ground_truth in zip(predictions, ground_truths):
+        false_pos = 0
+        true_pos = 0
+        false_neg = 0
+        true_neg = 0
+        for p,t in zip(prediction, ground_truth):
+            if p == True:
+                if t == True:
+                    true_pos = true_pos + 1
                 else:
-                    new_key = fs_embed_ln.format("bias")
-        elif "attention" in key:
-            # print(k)
-            groups = self_attn.search(key).groups()
-            fs_self_attn = "layers.{}.self_attn.{}_proj.{}"
-            fs_self_attn_ln = "layers.{}.self_attn_layer_norm.{}"
-            if int(groups[0]) >= num_layers:
-                new_key = None
-            elif "query" in key:
-                # print(fs_self_attn.format(groups[0], groups[2], groups[-1]))
-                new_key = fs_self_attn.format(groups[0], groups[2], groups[-1])
-            elif "key" in key:
-                # print(fs_self_attn.format(groups[0], groups[3], groups[-1]))
-                new_key = fs_self_attn.format(groups[0], groups[3], groups[-1])
-            elif "value" in key:
-                # print(fs_self_attn.format(groups[0], groups[4], groups[-1]))
-                new_key = fs_self_attn.format(groups[0], groups[4], groups[-1])
-            elif "output.dense" in key:
-                # print(fs_self_attn.format(groups[0], groups[5], groups[-1]))
-                new_key = fs_self_attn.format(groups[0], groups[5], groups[-1])
+                    false_pos = false_pos + 1
             else:
-                # print(fs_self_attn_ln.format(groups[0], groups[-1]))
-                if groups[-1] == 'gamma':
-                    new_key = fs_self_attn_ln.format(groups[0], "weight")
+                if t == True:
+                    false_neg = false_neg + 1
                 else:
-                    new_key = fs_self_attn_ln.format(groups[0], "bias")
+                    true_neg = true_neg + 1
+        summary_df.append({"true_pos": true_pos, "false_pos": false_pos, "true_neg": true_neg, "false_neg": false_neg})
+    summary_df = pd.DataFrame(summary_df)
+    return(summary_df.sum())
 
-        elif "dense" in key and "pooler" not in key and "cls" not in key:
-            groups = ffns.search(key).groups()
-            # print(groups)
-            ffns_f1 = "layers.{}.fc1.{}"
-            ffns_f2 = "layers.{}.fc2.{}"
-            if int(groups[0]) >= num_layers:
-                new_key = None
-            elif "intermediate" in key:
-                # print(ffns_f1.format(groups[0], groups[-1]))
-                new_key = ffns_f1.format(groups[0], groups[-1])
-            else:
-                # print(ffns_f2.format(groups[0], groups[-1]))
-                new_key = ffns_f2.format(groups[0], groups[-1])
+def _random_delete(target_tokens, bos, eos, pad):
 
-        elif "LayerNorm" in key and "cls" not in key:
-            # print(key)
-            groups = ffns_ln_p.search(key).groups()
-            ffns_ln = "layers.{}.final_layer_norm.{}"
-            # print(groups)
-            # print(ffns_ln.format(groups[0], groups[-1]))
-            if int(groups[0]) >= num_layers:
-                new_key = None
-            elif groups[-1] == "gamma":
-                new_key = ffns_ln.format(groups[0], "weight")
-            else:
-                new_key = ffns_ln.format(groups[0], "bias")
+    max_len = target_tokens.size(1)
+    target_mask = target_tokens.eq(pad)
+    target_score = target_tokens.clone().float().uniform_()
+    target_score.masked_fill_(
+        target_tokens.eq(bos) | target_tokens.eq(eos), 0.0
+    )
 
-        else:
-            new_key = None
+    target_score.masked_fill_(target_mask, 1)
+    target_score, target_rank = target_score.sort(1)
+    target_length = target_mask.size(1) - target_mask.float().sum(
+        1, keepdim=True
+    )
 
-        if new_key is not None:
-            # print(model[key].shape)
-            # print(new_key, key)
-            # print(state_dict[new_key].shape, pretrained_state_dict[key].shape)
-            #print(key,new_key)
+    # do not delete <bos> and <eos> (we assign 0 score for them)
+    target_cutoff = (
+        2
+        + (
+            (target_length - 2)
+            * target_score.new_zeros(target_score.size(0), 1).uniform_()
+        ).long()
+    )
+    target_cutoff = target_score.sort(1)[1] >= target_cutoff
 
-            assert new_key in state_dict, (
-                "{} Transformer encoder / decoder "
-                "state_dict does not contain {}. Cannot "
-                "load {} from pretrained XLM checkpoint "
-                "{} into Transformer.".format(
-                    str(state_dict.keys()),
-                    new_key, key, pretrained_state_dict)
-                )
+    prev_target_tokens = (
+        target_tokens.gather(1, target_rank)
+        .masked_fill_(target_cutoff, pad)
+        .gather(1, target_rank.masked_fill_(target_cutoff, max_len).sort(1)[1])
+    )
+    '''
+    prev_target_tokens = prev_target_tokens[
+        :, : prev_target_tokens.ne(pad).sum(1).max()
+    ]
+    '''
+    return prev_target_tokens
 
-            if new_key == "embed_tokens.weight":
-                state_dict[new_key][4:] = pretrained_state_dict[key]
-            elif new_key == "embed_positions.weight":
-                state_dict[new_key][2:] = pretrained_state_dict[key]
-            else:
-                assert state_dict[new_key].shape == pretrained_state_dict[key].shape
-                state_dict[new_key] = pretrained_state_dict[key]
+def _expert_delete(prev_output_tokens, tgt_tokens, pad):
 
-    return state_dict
+    word_del_targets = _get_del_targets(prev_output_tokens, tgt_tokens, pad)
+    max_len = prev_output_tokens.size(1)
+    reordering = new_arange(prev_output_tokens).masked_fill_(word_del_targets.bool(), max_len).sort(1)[1]
+    del_tokens = prev_output_tokens.masked_fill(word_del_targets.bool(), pad).gather(1, reordering)
+    return del_tokens
 
 
 
-@register_model("b2b_levenshtein_transformer")
-class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
+
+
+@register_model("final_levenshtein_transformer")
+class FinalLevenshteinTransformerModel(FairseqNATModel):
     @property
     def allow_length_beam(self):
         return False
 
     @staticmethod
     def add_args(parser):
-        LevenshteinTransformerModel.add_args(parser)
+        FairseqNATModel.add_args(parser)
 
         parser.add_argument(
-            "--bert-checkpoint",
-            help="path of the bert state dict file",
+            "--early-exit",
+            default="6,6,6",
+            type=str,
+            help="number of decoder layers before word_del, mask_ins, word_ins",
         )
 
         parser.add_argument(
-            "--init-CA-with-SA", action="store_true",
-            help="initialize cross attention weights with bert self attention weights",
+            "--no-share-discriminator",
+            action="store_true",
+            help="separate parameters for discriminator",
         )
 
         parser.add_argument(
-            "--change-sym", action="store_true",
-            help="",
+            "--no-share-maskpredictor",
+            action="store_true",
+            help="separate parameters for mask-predictor",
+        )
+
+        parser.add_argument(
+            "--share-discriminator-maskpredictor",
+            action="store_true",
+            help="share the parameters for both mask-predictor and discriminator",
+        )
+
+        parser.add_argument(
+            "--sampling-for-deletion",
+            action="store_true",
+            help="instead of argmax, use sampling to predict the tokens",
+        )
+
+        parser.add_argument(
+            "--dae-ratio",
+            type=float,
+            help="the probability of using noise injected target to learn the insertion policy",
+        )
+
+        parser.add_argument(
+            "--alpha-ratio",
+            type=float,
+            help="the probability of using init tokens to learn the deletion policy",
+        )
+
+        parser.add_argument(
+            "--within-batch", action="store_true",
+            help="mixed dae and actual distribution within batch",
+        )
+
+        parser.add_argument(
+            "--train-step",
+            type=int,
+            help="number of refinement iterations during training",
+        )
+
+        parser.add_argument(
+            "--dae-for-first-iter", action="store_true",
+            help="use dae just in the first step of training steps",
+        )
+
+        parser.add_argument(
+            "--model-del", action="store_true",
+            help="use model delete instead of the oracle to learn the insertion policy",
         )
 
 
     def __init__(self, args, encoder, decoder):
-
         super().__init__(args, encoder, decoder)
-
-        if getattr(args, "change_sym", False):
-            self.bos = decoder.bos
-            self.eos = decoder.eos
-            self.unk = decoder.unk
-
-        if getattr(args, "bert_checkpoint", None) is not None:
-            pretrained_bert = torch.load(getattr(args, "bert_checkpoint"))
-            loaded_state_dict = upgrade_state_dict_with_pretrained_weights(encoder.state_dict(),pretrained_bert,args.decoder_layers)
-            encoder.load_state_dict(loaded_state_dict, strict=True)
-            decoder_state_dict = decoder.state_dict()
-            for k in decoder_state_dict.keys():
-                if k not in loaded_state_dict:
-                    if 'encoder_attn' in k and getattr(args, "init_CA_with_SA", False):
-                        loaded_state_dict[k] = loaded_state_dict[k.replace('encoder_attn', 'self_attn')]
-                    else:
-                        loaded_state_dict[k] = decoder_state_dict[k]
-            decoder.load_state_dict(loaded_state_dict, strict=True)
-
-
-
 
     @classmethod
     def build_model(cls, args, task):
         model = super().build_model(args, task)
         model.dae_ratio = getattr(args, "dae_ratio", 0.5)
         model.alpha_ratio = getattr(args, "alpha_ratio", 0.5)
+        model.within_batch = getattr(args, "within_batch", False)
+        model.train_step = getattr(args, "train_step", 1)
+        model.dae_for_first_iter = getattr(args, "dae_for_first_iter", False)
+        model.random_policy = getattr(args, "random_policy", "rnd-del")
+        model.model_del = getattr(args, "model_del", False)
         return model
 
     @classmethod
@@ -200,50 +195,111 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
         return decoder
 
     def forward(
-        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, **kwargs
+        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, train_step, **kwargs
     ):
-
-
-        print("src_tokens: ", src_tokens)
-        print("prev_output_tokens: ", prev_output_tokens)
-        print("tgt_tokens: ", tgt_tokens)
 
         assert tgt_tokens is not None, "forward function only supports training."
         encoder_out = self.encoder(src_tokens, src_lengths=src_lengths, **kwargs)
 
-        # fill pad to src_tokens or tgt_tokens to have a similar size
+        B, T = tgt_tokens.size()
+        V = len(self.decoder.dictionary)
+
+        if train_step is None:
+            train_step = 1
+        '''
+        if self.roll_out:
+            if train_step > 1:
+                init_tokens_list = []
+                init_tokens_list.append(prev_output_tokens)
+                for t in range(train_step - 1):
+                    output_scores = init_tokens_list[t].new_zeros(
+                        *init_tokens_list[t].size()
+                    ).type_as(encoder_out["encoder_out"][0])
+                    decoder_out = DecoderOut(
+                        output_tokens=init_tokens_list[t],
+                        output_scores=output_scores,
+                        attn=None,
+                        step=0,
+                        max_step=0,
+                        history=None
+                    )
+                    decoder_out = self.forward_decoder(decoder_out, encoder_out, None, max_ratio=2)
+                    init_tokens_list.append(decoder_out.output_tokens)
+                inits_max_len = max([init_tokens.size(1) for init_tokens in init_tokens_list])
+                print(inits_max_len)
+                for i in range(len(init_tokens_list)):
+                    print("before: ",init_tokens_list[i].size())
+                    if init_tokens_list[i].size(1) < inits_max_len:
+                        pads = init_tokens_list[i].new_full((init_tokens_list[i].size(0),inits_max_len - init_tokens_list[i].size(1)),self.pad)
+                        init_tokens_list[i] = torch.cat([init_tokens_list[i],pads],1)
+                    print("after:", init_tokens_list[i].size())
+                prev_output_tokens = init_tokens_list[0]
+                rand_ind = torch.rand(size=(B,), device=tgt_tokens.device)
+                for t in range(train_step):
+                    curr_ind = (rand_ind > t/train_step) & (rand_ind <= (t+1)/train_step)
+                    prev_output_tokens[curr_ind] = init_tokens_list[t][curr_ind]
+        '''
         if prev_output_tokens.size(1) > tgt_tokens.size(1):
             pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
             tgt_tokens = torch.cat([tgt_tokens,pads],1)
         if prev_output_tokens.size(1) < tgt_tokens.size(1):
             pads = prev_output_tokens.new_full((prev_output_tokens.size(0), tgt_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
             prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
-        #print("src_tokens: ", src_tokens)
-        #print("tgt_tokens: ", tgt_tokens)
-        B, T = tgt_tokens.size()
-        corrupted = (
-                        torch.rand(size=(B,), device=tgt_tokens.device)
-                        < self.dae_ratio
-                    )
-        noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
-        y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
-        y_ins[corrupted] = noisy_target[corrupted]
 
-        #print("corrupted indices: ", corrupted)
-        #print("y_ins: ", y_ins)
+        if self.within_batch:
+            corrupted = (
+                            torch.rand(size=(B,), device=tgt_tokens.device)
+                            < self.dae_ratio
+                        )
+            if self.random_policy == "rnd-del":
+                noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
+            else:
+                noisy_target = _sequential_poisoning(prev_output_tokens, V, 0.33, self.bos, self.eos, self.pad)
+                noisy_target = _expert_delete(noisy_target, tgt_tokens, self.pad)
+
+            if self.model_del:
+
+                word_del_score, word_del_attn = self.decoder.forward_word_del(
+                    normalize=True,
+                    prev_output_tokens=prev_output_tokens,
+                    encoder_out=encoder_out,
+                )
+
+                word_del_pred = word_del_score.max(-1)[1].bool()
+
+                y_ins, _, _ = _apply_del_words(
+                    prev_output_tokens,
+                    None,
+                    None,
+                    word_del_pred,
+                    self.pad,
+                    self.bos,
+                    self.eos,
+                )
+            else:
+                y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+
+            y_ins[corrupted] = noisy_target[corrupted]
+
+        else:
+            if random.uniform(0,1) < self.dae_ratio:
+                y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
+            else:
+                y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
 
         # generate training labels for insertion
-        masked_tgt_masks, masked_tgt_tokens, mask_ins_targets = _get_ins_targets(
+        masked_tgt_masks, masked_tgt_tokens, mask_ins_target = _get_ins_targets(
             y_ins, tgt_tokens, self.pad, self.unk
         )
-        mask_ins_targets = mask_ins_targets.clamp(min=0, max=255)  # for safe prediction
-        mask_ins_masks = y_ins[:, 1:].ne(self.pad)
+        mask_ins_target = mask_ins_target.clamp(min=0, max=255)  # for safe prediction
+        mask_ins_mask = y_ins[:, 1:].ne(self.pad)
 
         mask_ins_out, _ = self.decoder.forward_mask_ins(
             normalize=False,
             prev_output_tokens=y_ins,
             encoder_out=encoder_out,
         )
+
 
         word_ins_out, _ = self.decoder.forward_word_ins(
             normalize=False,
@@ -264,7 +320,7 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
         )
 
         # generate training labels for deletion
-        if prev_output_tokens.size(1) > 2:
+        if self.within_batch:
             y_del = word_predictions
             init_seq = (
                             torch.rand(size=(B,), device=tgt_tokens.device)
@@ -272,22 +328,29 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
                         )
             y_del[init_seq] = prev_output_tokens[init_seq]
         else:
-            y_del = word_predictions
-        #print("init_seq_for_delete: ", init_seq)
-        #print("y_del: ", y_del)
-        word_del_targets = _get_del_targets(y_del, tgt_tokens, self.pad)
+            if prev_output_tokens.size(1) > 2:
+                if random.uniform(0,1) < self.alpha_ratio:
+                    y_del = prev_output_tokens
+                else:
+                    y_del = word_predictions
+            else:
+                y_del = word_predictions
+
+
+
+        word_del_target = _get_del_targets(y_del, tgt_tokens, self.pad)
         word_del_out, _ = self.decoder.forward_word_del(
             normalize=False,
             prev_output_tokens=y_del,
             encoder_out=encoder_out,
         )
-        word_del_masks = y_del.ne(self.pad)
+        word_del_mask = y_del.ne(self.pad)
 
         return {
             "mask_ins": {
                 "out": mask_ins_out,
-                "tgt": mask_ins_targets,
-                "mask": mask_ins_masks,
+                "tgt": mask_ins_target,
+                "mask": mask_ins_mask,
                 "ls": 0.01,
             },
             "word_ins": {
@@ -299,22 +362,22 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
             },
             "word_del": {
                 "out": word_del_out,
-                "tgt": word_del_targets,
-                "mask": word_del_masks,
+                "tgt": word_del_target,
+                "mask": word_del_mask,
             },
 
         }
 
 
     def forward_decoder(
-        self, decoder_out, encoder_out, eos_penalty=0.0, max_ratio=None, **kwargs
+        self, decoder_out, encoder_out, target_tokens, eos_penalty=0.0, max_ratio=None,
+        oracle_del=False, oracle_ins=False, **kwargs
     ):
-
+        print(decoder_out.step, ": ", decoder_out.output_tokens)
         output_tokens = decoder_out.output_tokens
         output_scores = decoder_out.output_scores
         attn = decoder_out.attn
         history = decoder_out.history
-
         bsz = output_tokens.size(0)
         if max_ratio is None:
             max_lens = torch.zeros_like(output_tokens).fill_(255)
@@ -325,19 +388,46 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
             else:
                 src_lens = (~encoder_out["encoder_padding_mask"][0]).sum(1)
             max_lens = (src_lens * max_ratio).clamp(min=10).long()
-
         # delete words
         # do not delete tokens if it is <s> </s>
         can_del_word = output_tokens.ne(self.pad).sum(1) > 2
         if can_del_word.sum() != 0:  # we cannot delete, skip
-            word_del_score, word_del_attn = self.decoder.forward_word_del(
-                normalize=True,
-                prev_output_tokens=_skip(output_tokens, can_del_word),
-                encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
-            )
-            word_del_pred = word_del_score.max(-1)[1].bool()
-            print("seq length: ", output_tokens.ne(self.pad).sum(1))
-            print("num del pred: ", word_del_pred.sum(1))
+            if oracle_del:
+                word_del_pred = _get_del_targets(
+                    _skip(output_tokens, can_del_word),
+                    _skip(target_tokens, can_del_word), self.pad).bool()
+                word_del_attn = None
+                word_del_score = None
+
+
+                s = summary(word_del_pred,word_del_pred)
+                recall = s['true_pos'] / (s['true_pos'] + s['false_neg'])
+                precision = s['true_pos'] / (s['true_pos'] + s['false_pos'])
+                print(_skip(output_tokens, can_del_word).size(0), "sentences in step ", decoder_out.step)
+                print(s['true_pos'] + s['false_neg'], " should be deleted")
+                print(s['true_pos'] + s['false_pos'], " deleted")
+                print("recall: ", recall, ", precision: ", precision)
+            else:
+                word_del_score, word_del_attn = self.decoder.forward_word_del(
+                    normalize=True,
+                    prev_output_tokens=_skip(output_tokens, can_del_word),
+                    encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
+                )
+                word_del_pred = word_del_score.max(-1)[1].bool()
+
+
+                oracle_word_del_pred = _get_del_targets(
+                    _skip(output_tokens, can_del_word),
+                    _skip(target_tokens, can_del_word), self.pad).bool()
+                s = summary(word_del_pred,oracle_word_del_pred)
+                recall = s['true_pos'] / (s['true_pos'] + s['false_neg'])
+                precision = s['true_pos'] / (s['true_pos'] + s['false_pos'])
+                print(_skip(output_tokens, can_del_word).size(0), "sentences in step ", decoder_out.step)
+                print(s['true_pos'] + s['false_neg'], " should be deleted")
+                print(s['true_pos'] + s['false_pos'], " deleted")
+                print("recall: ", recall, ", precision: ", precision)
+
+
             _tokens, _scores, _attn = _apply_del_words(
                 output_tokens[can_del_word],
                 output_scores[can_del_word],
@@ -368,6 +458,7 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
             mask_ins_pred = torch.min(
                 mask_ins_pred, max_lens[can_ins_mask, None].expand_as(mask_ins_pred)
             )
+
             _tokens, _scores = _apply_ins_masks(
                 output_tokens[can_ins_mask],
                 output_scores[can_ins_mask],
@@ -441,19 +532,18 @@ class b2bLevenshteinTransformerModel(LevenshteinTransformerModel):
         )
 
 
+
 class LevenshteinTransformerDecoder(FairseqNATDecoder):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
         super().__init__(
             args, dictionary, embed_tokens, no_encoder_attn=no_encoder_attn
         )
         self.dictionary = dictionary
-        #self.bos = dictionary.bos()
-        #self.unk = dictionary.unk()
-        #self.eos = dictionary.eos()
-        self.bos = dictionary.index('[CLS]')
-        self.eos = dictionary.index('[SEP]')
-        self.unk = dictionary.index('[MASK]')
+        self.bos = dictionary.bos()
+        self.unk = dictionary.unk()
+        self.eos = dictionary.eos()
         self.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
+        #changed 256 to 100 however it seems that there was a sample needed more than that
         self.embed_mask_ins = Embedding(256, self.output_embed_dim * 2, None)
         self.embed_word_del = Embedding(2, self.output_embed_dim, None)
 
@@ -602,38 +692,34 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         return decoder_out, extra["attn"]
 
 
-@register_model_architecture("b2b_levenshtein_transformer", "b2b_levenshtein_transformer")
+@register_model_architecture("final_levenshtein_transformer", "final_levenshtein_transformer")
 def levenshtein_base_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
-    args.layernorm_embedding = getattr(args, "layernorm_embedding", True)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
-    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 3072)
-    args.encoder_layers = getattr(args, "encoder_layers", 12)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
+    args.encoder_layers = getattr(args, "encoder_layers", 6)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
-    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
-
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
     args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_ffn_embed_dim = getattr(
         args, "decoder_ffn_embed_dim", args.encoder_ffn_embed_dim
     )
-    args.decoder_layers = getattr(args, "decoder_layers", 12)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
+    args.decoder_layers = getattr(args, "decoder_layers", 6)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
-
-    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
-
-    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    args.activation_fn = getattr(args, "activation_fn", "relu")
     args.dropout = getattr(args, "dropout", 0.1)
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
     args.share_decoder_input_output_embed = getattr(
-        args, "share_decoder_input_output_embed", True
+        args, "share_decoder_input_output_embed", False
     )
-    args.share_all_embeddings = getattr(args, "share_all_embeddings", True)
+    args.share_all_embeddings = getattr(args, "share_all_embeddings", False)
     args.no_token_positional_embeddings = getattr(
         args, "no_token_positional_embeddings", False
     )
@@ -645,7 +731,7 @@ def levenshtein_base_architecture(args):
     )
     args.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
     args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
-    args.early_exit = getattr(args, "early_exit", "12,12,12")
+    args.early_exit = getattr(args, "early_exit", "6,6,6")
     args.no_share_discriminator = getattr(args, "no_share_discriminator", False)
     args.no_share_maskpredictor = getattr(args, "no_share_maskpredictor", False)
     args.share_discriminator_maskpredictor = getattr(

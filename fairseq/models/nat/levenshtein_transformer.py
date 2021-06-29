@@ -4,6 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 import re
 import random
+import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,8 +27,38 @@ from .levenshtein_utils import (
     _skip_encoder_out,
 )
 
+def summary(predictions, ground_truths):
+    summary_df = []
+    for prediction, ground_truth in zip(predictions, ground_truths):
+        false_pos = 0
+        true_pos = 0
+        false_neg = 0
+        true_neg = 0
+        for p,t in zip(prediction, ground_truth):
+            if p == True:
+                if t == True:
+                    true_pos = true_pos + 1
+                else:
+                    false_pos = false_pos + 1
+            else:
+                if t == True:
+                    false_neg = false_neg + 1
+                else:
+                    true_neg = true_neg + 1
+        summary_df.append({"true_pos": true_pos, "false_pos": false_pos, "true_neg": true_neg, "false_neg": false_neg})
+    summary_df = pd.DataFrame(summary_df)
+    return(summary_df.sum())
 
-def _random_delete(target_tokens, bos, eos, pad):
+def same_size(t1, t2, pad_idx):
+    if t1.size(1) > t2.size(1):
+        pads = t2.new_full((t2.size(0), t1.size(1) - t2.size(1)),pad_idx)
+        t2 = torch.cat([t2,pads],1)
+    if t1.size(1) < t2.size(1):
+        pads = t1.new_full((t1.size(0), t2.size(1) - t1.size(1)),pad_idx)
+        t1 = torch.cat([t1,pads],1)
+    return(t1,t2)
+
+def _random_delete(target_tokens, bos, eos, pad, rnd_type):
 
     max_len = target_tokens.size(1)
     target_mask = target_tokens.eq(pad)
@@ -34,22 +66,26 @@ def _random_delete(target_tokens, bos, eos, pad):
     target_score.masked_fill_(
         target_tokens.eq(bos) | target_tokens.eq(eos), 0.0
     )
+
     target_score.masked_fill_(target_mask, 1)
     target_score, target_rank = target_score.sort(1)
     target_length = target_mask.size(1) - target_mask.float().sum(
         1, keepdim=True
     )
 
+    rnd_score = target_score.new_zeros(target_score.size(0), 1).uniform_()
+
+    if rnd_type == 'exp':
+        rnd_score = (1 - torch.exp(-2*rnd_score))/(1 - torch.exp(torch.tensor([-2.0]).to(rnd_score.device)))
     # do not delete <bos> and <eos> (we assign 0 score for them)
     target_cutoff = (
         2
         + (
             (target_length - 2)
-            * target_score.new_zeros(target_score.size(0), 1).uniform_()
+            * rnd_score
         ).long()
     )
     target_cutoff = target_score.sort(1)[1] >= target_cutoff
-
     prev_target_tokens = (
         target_tokens.gather(1, target_rank)
         .masked_fill_(target_cutoff, pad)
@@ -69,8 +105,6 @@ def _expert_delete(prev_output_tokens, tgt_tokens, pad):
     reordering = new_arange(prev_output_tokens).masked_fill_(word_del_targets.bool(), max_len).sort(1)[1]
     del_tokens = prev_output_tokens.masked_fill(word_del_targets.bool(), pad).gather(1, reordering)
     return del_tokens
-
-
 
 
 
@@ -122,15 +156,23 @@ class LevenshteinTransformerModel(FairseqNATModel):
         )
 
         parser.add_argument(
+            "--dae-type",
+            type=str,
+            help="noisy-src or noisy-tgt",
+        )
+
+        parser.add_argument(
+            "--noise-type",
+            type=str,
+            help="uniform or exp",
+        )
+
+        parser.add_argument(
             "--alpha-ratio",
             type=float,
             help="the probability of using init tokens to learn the deletion policy",
         )
 
-        parser.add_argument(
-            "--within-batch", action="store_true",
-            help="mixed dae and actual distribution within batch",
-        )
 
         parser.add_argument(
             "--train-step",
@@ -138,15 +180,6 @@ class LevenshteinTransformerModel(FairseqNATModel):
             help="number of refinement iterations during training",
         )
 
-        parser.add_argument(
-            "--dae-for-first-iter", action="store_true",
-            help="use dae just in the first step of training steps",
-        )
-
-        parser.add_argument(
-            "--roll-out", action="store_true",
-            help="aggregate roll-out data during training",
-        )
 
         parser.add_argument(
             "--model-del", action="store_true",
@@ -162,12 +195,9 @@ class LevenshteinTransformerModel(FairseqNATModel):
         model = super().build_model(args, task)
         model.dae_ratio = getattr(args, "dae_ratio", 0.5)
         model.alpha_ratio = getattr(args, "alpha_ratio", 0.5)
-        model.within_batch = getattr(args, "within_batch", False)
-        model.train_step = getattr(args, "train_step", 1)
-        model.dae_for_first_iter = getattr(args, "dae_for_first_iter", False)
-        model.random_policy = getattr(args, "random_policy", "rnd-del")
         model.model_del = getattr(args, "model_del", False)
-        model.roll_out = getattr(args, "roll_out", False)
+        model.dae_type = getattr(args, "dae_type", "noisy_tgt")
+        model.noise_type = getattr(args, "noise_type", "uniform")
         return model
 
     @classmethod
@@ -178,7 +208,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
         return decoder
 
     def forward(
-        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, train_step, **kwargs
+        self, src_tokens, src_lengths, prev_output_tokens, tgt_tokens, **kwargs
     ):
 
         assert tgt_tokens is not None, "forward function only supports training."
@@ -187,6 +217,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
         B, T = tgt_tokens.size()
         V = len(self.decoder.dictionary)
 
+        '''
         if train_step is None:
             train_step = 1
 
@@ -222,6 +253,15 @@ class LevenshteinTransformerModel(FairseqNATModel):
                     curr_ind = (rand_ind > t/train_step) & (rand_ind <= (t+1)/train_step)
                     prev_output_tokens[curr_ind] = init_tokens_list[t][curr_ind]
 
+
+
+
+        if prev_output_tokens.size(1) == 2:
+            init_type = 'empty'
+        else:
+            init_type = 'src'
+
+
         if prev_output_tokens.size(1) > tgt_tokens.size(1):
             pads = tgt_tokens.new_full((tgt_tokens.size(0),prev_output_tokens.size(1) - tgt_tokens.size(1)),self.pad)
             tgt_tokens = torch.cat([tgt_tokens,pads],1)
@@ -229,28 +269,19 @@ class LevenshteinTransformerModel(FairseqNATModel):
             pads = prev_output_tokens.new_full((prev_output_tokens.size(0), tgt_tokens.size(1) - prev_output_tokens.size(1)),self.pad)
             prev_output_tokens = torch.cat([prev_output_tokens,pads],1)
 
+        if init_type == 'empty':
 
-        if self.within_batch:
-            corrupted = (
-                            torch.rand(size=(B,), device=tgt_tokens.device)
-                            < self.dae_ratio
-                        )
-            if self.random_policy == "rnd-del":
-                noisy_target = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
-            else:
-                noisy_target = _sequential_poisoning(prev_output_tokens, V, 0.33, self.bos, self.eos, self.pad)
-                noisy_target = _expert_delete(noisy_target, tgt_tokens, self.pad)
+            y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad, "uniform")
+
+        else:
 
             if self.model_del:
-
                 word_del_score, word_del_attn = self.decoder.forward_word_del(
                     normalize=True,
                     prev_output_tokens=prev_output_tokens,
                     encoder_out=encoder_out,
                 )
-
                 word_del_pred = word_del_score.max(-1)[1].bool()
-
                 y_ins, _, _ = _apply_del_words(
                     prev_output_tokens,
                     None,
@@ -263,13 +294,34 @@ class LevenshteinTransformerModel(FairseqNATModel):
             else:
                 y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
 
-            y_ins[corrupted] = noisy_target[corrupted]
-
-        else:
-            if random.uniform(0,1) < self.dae_ratio:
-                y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad)
+            corrupted = (
+                            torch.rand(size=(B,), device=tgt_tokens.device)
+                            < self.dae_ratio
+                        )
+            if self.dae_type == 'noisy_src':
+                if self.noise_type == 'uniform':
+                    noisy_y_ins = _random_delete(prev_output_tokens, self.bos, self.eos, self.pad, 'uniform')
+                else:
+                    noisy_y_ins = _random_delete(prev_output_tokens, self.bos, self.eos, self.pad, 'exp')
             else:
-                y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+                if self.noise_type == 'uniform':
+                    noisy_y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad, 'uniform')
+                else:
+                    noisy_y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad, 'exp')
+            y_ins[corrupted] = noisy_y_ins[corrupted]
+
+
+        '''
+        prev_output_tokens, tgt_tokens = same_size(prev_output_tokens, tgt_tokens, self.pad)
+        y_ins = _expert_delete(prev_output_tokens, tgt_tokens, self.pad)
+        if self.dae_ratio > 0:
+            corrupted = (
+                            torch.rand(size=(B,), device=tgt_tokens.device)
+                            < self.dae_ratio
+                        )
+            noisy_y_ins = _random_delete(tgt_tokens, self.bos, self.eos, self.pad, 'uniform')
+            y_ins[corrupted] = noisy_y_ins[corrupted]
+
 
         # generate training labels for insertion
         masked_tgt_masks, masked_tgt_tokens, mask_ins_target = _get_ins_targets(
@@ -304,22 +356,15 @@ class LevenshteinTransformerModel(FairseqNATModel):
         )
 
         # generate training labels for deletion
-        if self.within_batch:
-            y_del = word_predictions
+
+        y_del = word_predictions
+
+        if self.alpha_ratio > 0:
             init_seq = (
                             torch.rand(size=(B,), device=tgt_tokens.device)
                             < self.alpha_ratio
                         )
             y_del[init_seq] = prev_output_tokens[init_seq]
-        else:
-            if prev_output_tokens.size(1) > 2:
-                if random.uniform(0,1) < self.alpha_ratio:
-                    y_del = prev_output_tokens
-                else:
-                    y_del = word_predictions
-            else:
-                y_del = word_predictions
-
 
 
         word_del_target = _get_del_targets(y_del, tgt_tokens, self.pad)
@@ -329,6 +374,8 @@ class LevenshteinTransformerModel(FairseqNATModel):
             encoder_out=encoder_out,
         )
         word_del_mask = y_del.ne(self.pad)
+
+
 
         return {
             "mask_ins": {
@@ -349,19 +396,41 @@ class LevenshteinTransformerModel(FairseqNATModel):
                 "tgt": word_del_target,
                 "mask": word_del_mask,
             },
-
         }
 
 
     def forward_decoder(
-        self, decoder_out, encoder_out, target_tokens, eos_penalty=0.0, max_ratio=None,
-        oracle_del=False, oracle_ins=False, **kwargs
+        self, decoder_out, encoder_out, tgt_tokens, eos_penalty=0.0, max_ratio=None,
+        oracle_del=False, oracle_ins=False, confidence=0, **kwargs
     ):
         output_tokens = decoder_out.output_tokens
+        '''
+        token_ids = []
+        for t in output_tokens:
+            if t[0] == 2:
+                t = torch.cat((torch.tensor([0]),t[:-1]))
+            sent = self.decoder.dictionary.string(
+                t,
+                bpe_symbol=None,
+                escape_unk=False,
+                extra_symbols_to_ignore=None,
+                unk_string=None,
+                include_eos=False,
+            )
+            cnt = 1
+            token_id = [0]
+            for subtoken in sent.split(" "):
+                token_id.append(cnt)
+                if not subtoken.endswith("@@"):
+                    cnt = cnt + 1
+            token_id.append(cnt)
+            token_id = torch.tensor(token_id).unsqueeze(0)
+            token_ids.append(token_id)
+        token_ids = torch.cat(token_ids, dim = 0)
+        '''
         output_scores = decoder_out.output_scores
         attn = decoder_out.attn
         history = decoder_out.history
-
         bsz = output_tokens.size(0)
         if max_ratio is None:
             max_lens = torch.zeros_like(output_tokens).fill_(255)
@@ -379,17 +448,60 @@ class LevenshteinTransformerModel(FairseqNATModel):
             if oracle_del:
                 word_del_pred = _get_del_targets(
                     _skip(output_tokens, can_del_word),
-                    _skip(target_tokens, can_del_word), self.pad).bool()
+                    _skip(tgt_tokens, can_del_word), self.pad).bool()
                 word_del_attn = None
                 word_del_score = None
+
+                '''
+                s = summary(word_del_pred,word_del_pred)
+                recall = s['true_pos'] / (s['true_pos'] + s['false_neg'])
+                precision = s['true_pos'] / (s['true_pos'] + s['false_pos'])
+                print(_skip(output_tokens, can_del_word).size(0), "sentences in step ", decoder_out.step)
+                print(s['true_pos'] + s['false_neg'], " should be deleted")
+                print(s['true_pos'] + s['false_pos'], " deleted")
+                print("recall: ", recall, ", precision: ", precision)
+                '''
             else:
+                '''
+                if decoder_out.step == 0:
+
+                    word_del_score, word_del_attn = self.decoder.first_forward_word_del(
+                        normalize=True,
+                        prev_output_tokens=_skip(output_tokens, can_del_word),
+                        encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
+                    )
+                    word_del_pred = word_del_score.max(-1)[1].bool()
+
+                '''
+
+
                 word_del_score, word_del_attn = self.decoder.forward_word_del(
                     normalize=True,
                     prev_output_tokens=_skip(output_tokens, can_del_word),
                     encoder_out=_skip_encoder_out(self.encoder, encoder_out, can_del_word),
                 )
+                word_del_score = torch.exp(word_del_score)
                 word_del_pred = word_del_score.max(-1)[1].bool()
 
+                '''
+                print("word del pred before bias: ", word_del_pred)
+                word_del_score[:,:,0] = word_del_score[:,:,0] + confidence
+                word_del_score[:,:,1] = word_del_score[:,:,1] - confidence
+                word_del_pred = word_del_score.max(-1)[1].bool()
+                print("word del pred after bias: ", word_del_pred)
+                '''
+                '''
+                oracle_word_del_pred = _get_del_targets(
+                    _skip(output_tokens, can_del_word),
+                    _skip(tgt_tokens, can_del_word), self.pad).bool()
+                s = summary(word_del_pred,oracle_word_del_pred)
+                recall = s['true_pos'] / (s['true_pos'] + s['false_neg'])
+                precision = s['true_pos'] / (s['true_pos'] + s['false_pos'])
+                print(_skip(output_tokens, can_del_word).size(0), "sentences in step ", decoder_out.step)
+                print(s['true_pos'] + s['false_neg'], " should be deleted")
+                print(s['true_pos'] + s['false_pos'], " deleted")
+                print("recall: ", recall, ", precision: ", precision)
+                '''
             _tokens, _scores, _attn = _apply_del_words(
                 output_tokens[can_del_word],
                 output_scores[can_del_word],
@@ -405,7 +517,16 @@ class LevenshteinTransformerModel(FairseqNATModel):
 
             if history is not None:
                 history.append(output_tokens.clone())
-
+        '''
+        print("after delete ", decoder_out.step, ": ", self.decoder.dictionary.string(
+            output_tokens[0],
+            bpe_symbol=None,
+            escape_unk=False,
+            extra_symbols_to_ignore=None,
+            unk_string=None,
+            include_eos=False,
+        ))
+        '''
         # insert placeholders
         can_ins_mask = output_tokens.ne(self.pad).sum(1) < max_lens
         if can_ins_mask.sum() != 0:
@@ -417,6 +538,8 @@ class LevenshteinTransformerModel(FairseqNATModel):
             if eos_penalty > 0.0:
                 mask_ins_score[:, :, 0] = mask_ins_score[:, :, 0] - eos_penalty
             mask_ins_pred = mask_ins_score.max(-1)[1]
+            #print("mask pred at step ", decoder_out.step, ": ", torch.sum(mask_ins_pred,1))
+            #print("total mask pred at step ", decoder_out.step, ": ", torch.sum(mask_ins_pred))
             mask_ins_pred = torch.min(
                 mask_ins_pred, max_lens[can_ins_mask, None].expand_as(mask_ins_pred)
             )
@@ -458,7 +581,16 @@ class LevenshteinTransformerModel(FairseqNATModel):
 
             if history is not None:
                 history.append(output_tokens.clone())
-
+        '''
+        print("after insertion ", decoder_out.step, ": ", self.decoder.dictionary.string(
+            output_tokens[0],
+            bpe_symbol=None,
+            escape_unk=False,
+            extra_symbols_to_ignore=None,
+            unk_string=None,
+            include_eos=False,
+        ))
+        '''
         # delete some unnecessary paddings
         cut_off = output_tokens.ne(self.pad).sum(1).max()
         output_tokens = output_tokens[:, :cut_off]
@@ -494,6 +626,7 @@ class LevenshteinTransformerModel(FairseqNATModel):
         )
 
 
+
 class LevenshteinTransformerDecoder(FairseqNATDecoder):
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
         super().__init__(
@@ -507,7 +640,7 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         #changed 256 to 100 however it seems that there was a sample needed more than that
         self.embed_mask_ins = Embedding(256, self.output_embed_dim * 2, None)
         self.embed_word_del = Embedding(2, self.output_embed_dim, None)
-
+        #self.first_embed_word_del = Embedding(2, self.output_embed_dim, None)
         # del_word, ins_mask, ins_word
         self.early_exit = [int(i) for i in args.early_exit.split(",")]
         assert len(self.early_exit) == 3
@@ -637,7 +770,21 @@ class LevenshteinTransformerDecoder(FairseqNATDecoder):
         if normalize:
             return F.log_softmax(decoder_out, -1), extra["attn"]
         return decoder_out, extra["attn"]
-
+    '''
+    @ensemble_decoder
+    def first_forward_word_del(self, normalize, encoder_out, prev_output_tokens, **unused):
+        features, extra = self.extract_features(
+            prev_output_tokens,
+            encoder_out=encoder_out,
+            early_exit=self.early_exit[0],
+            layers=self.layers_del,
+            **unused
+        )
+        decoder_out = F.linear(features, self.first_embed_word_del.weight)
+        if normalize:
+            return F.log_softmax(decoder_out, -1), extra["attn"]
+        return decoder_out, extra["attn"]
+    '''
     @ensemble_decoder
     def forward_word_del(self, normalize, encoder_out, prev_output_tokens, **unused):
         features, extra = self.extract_features(
@@ -699,6 +846,60 @@ def levenshtein_base_architecture(args):
         args, "share_discriminator_maskpredictor", False
     )
     args.no_share_last_layer = getattr(args, "no_share_last_layer", False)
+
+
+@register_model_architecture("levenshtein_transformer", "b2b_arch_levenshtein_transformer")
+def b2b_arch_levenshtein_transformer(args):
+    args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
+    args.layernorm_embedding = getattr(args, "layernorm_embedding", True)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 3072)
+    args.encoder_layers = getattr(args, "encoder_layers", 12)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
+    args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
+
+    args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
+    args.decoder_ffn_embed_dim = getattr(
+        args, "decoder_ffn_embed_dim", args.encoder_ffn_embed_dim
+    )
+    args.decoder_layers = getattr(args, "decoder_layers", 12)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
+    args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
+    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
+
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
+    args.activation_dropout = getattr(args, "activation_dropout", 0.0)
+
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
+    args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
+    args.share_decoder_input_output_embed = getattr(
+        args, "share_decoder_input_output_embed", True
+    )
+    args.share_all_embeddings = getattr(args, "share_all_embeddings", True)
+    args.no_token_positional_embeddings = getattr(
+        args, "no_token_positional_embeddings", False
+    )
+    args.adaptive_input = getattr(args, "adaptive_input", False)
+    args.apply_bert_init = getattr(args, "apply_bert_init", False)
+
+    args.decoder_output_dim = getattr(
+        args, "decoder_output_dim", args.decoder_embed_dim
+    )
+    args.sampling_for_deletion = getattr(args, "sampling_for_deletion", False)
+    args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
+    args.early_exit = getattr(args, "early_exit", "12,12,12")
+    args.no_share_discriminator = getattr(args, "no_share_discriminator", False)
+    args.no_share_maskpredictor = getattr(args, "no_share_maskpredictor", False)
+    args.share_discriminator_maskpredictor = getattr(
+        args, "share_discriminator_maskpredictor", False
+    )
+    args.no_share_last_layer = getattr(args, "no_share_last_layer", False)
+
+
 
 
 @register_model_architecture(

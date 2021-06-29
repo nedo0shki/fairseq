@@ -184,6 +184,7 @@ def _main(cfg: DictConfig, output_file):
     num_sentences = 0
     has_target = True
     wps_meter = TimeMeter()
+    #all_p_gens = []
     for sample in progress:
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
@@ -198,6 +199,7 @@ def _main(cfg: DictConfig, output_file):
             constraints = sample["constraints"]
 
         gen_timer.start()
+
         hypos = task.inference_step(
             generator,
             models,
@@ -205,6 +207,17 @@ def _main(cfg: DictConfig, output_file):
             prefix_tokens=prefix_tokens,
             constraints=constraints,
         )
+        '''
+        hypos, p_gens = task.inference_step(
+            generator,
+            models,
+            sample,
+            prefix_tokens=prefix_tokens,
+            constraints=constraints,
+        )
+
+        all_p_gens.extend(p_gens)
+        '''
         num_generated_tokens = sum(len(h[0]["tokens"]) for h in hypos)
         gen_timer.stop(num_generated_tokens)
 
@@ -366,7 +379,12 @@ def _main(cfg: DictConfig, output_file):
         num_sentences += (
             sample["nsentences"] if "nsentences" in sample else sample["id"].numel()
         )
-
+    '''
+    p_file = open(cfg.generation.p_gen_file, "w")
+    for p in all_p_gens:
+        p_file.write(str(p)+"\n")
+    p_file.close()
+    '''
     logger.info("NOTE: hypothesis and token scores are output in base 2")
     logger.info(
         "Translated {:,} sentences ({:,} tokens) in {:.1f}s ({:.2f} sentences/s, {:.2f} tokens/s)".format(

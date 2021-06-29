@@ -18,6 +18,7 @@ from fairseq.models.transformer import (
     TransformerEncoder,
     TransformerModel,
     base_architecture,
+    transformer_bert2bert,
 )
 from fairseq.models.roberta import RobertaModel
 from torch import Tensor
@@ -307,6 +308,7 @@ class TransformerPointerGeneratorDecoder(TransformerDecoder):
             p_gens = torch.sigmoid(p_gens)
             x = self.output_layer(x, extra["attn"][0], encoder_out["src_tokens"][0], p_gens)
         return x, extra
+        #return x, extra, p_gens
 
     def output_layer(self, features, attn, src_tokens, p_gens, **kwargs):
         """
@@ -416,6 +418,17 @@ def transformer_pointer_generator(args):
     args.alignment_heads = getattr(args, "alignment_heads", 1)
     args.alignment_layer = getattr(args, "alignment_layer", -1)
     base_architecture(args)
+    if args.alignment_layer < 0:
+        args.alignment_layer = args.decoder_layers + args.alignment_layer
+
+@register_model_architecture(
+    "transformer_pointer_generator", "transformer_pointer_generator_bert2bert"
+)
+def transformer_pointer_generator(args):
+    args.alignment_heads = getattr(args, "alignment_heads", 1)
+    args.alignment_layer = getattr(args, "alignment_layer", -1)
+    args.source_position_markers = getattr(args, "source_position_markers", 0)
+    transformer_bert2bert(args)
     if args.alignment_layer < 0:
         args.alignment_layer = args.decoder_layers + args.alignment_layer
 

@@ -12,3 +12,4 @@ from .cmlm_transformer import *
 from .levenshtein_transformer import *
 from .insertion_transformer import *
 from .b2b_levenshtein_transformer import *
+from .iterative_levenshtein_transformer import *

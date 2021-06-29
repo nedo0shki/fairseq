@@ -28,10 +28,117 @@ from fairseq.modules import (
 from fairseq.modules.checkpoint_activations import checkpoint_wrapper
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
+import re
 
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
+
+
+def upgrade_state_dict_with_pretrained_weights(state_dict, pretrained_state_dict, num_layers):
+
+    embed_ln = re.compile("LayerNorm\.(gamma|beta)")
+    self_attn = re.compile(r"layer\.(\d+)\.+attention.+((q)uery|(k)ey|(v)alue|(out)put\.dense|(output)\.LayerNorm)\.(weight|bias|gamma|beta)")
+    ffns = re.compile(r"layer\.(\d+)\.(intermediate|output)\.dense\.(weight|bias)")
+    ffns_ln_p = re.compile(r"layer\.(\d+)\.output\.LayerNorm\.(gamma|beta)")
+
+
+    for key in pretrained_state_dict.keys():
+        # print(key)
+        if "embeddings" in key:
+            if "word" in key:
+                new_key = "embed_tokens.weight"
+            elif "position" in key:
+                new_key = 'embed_positions.weight'
+            elif "type" in key:
+                new_key = None
+            else:
+                fs_embed_ln = "layernorm_embedding.{}"
+                suff = embed_ln.search(key).group(1)
+                if suff == "gamma":
+                    new_key = fs_embed_ln.format("weight")
+                else:
+                    new_key = fs_embed_ln.format("bias")
+        elif "attention" in key:
+            # print(k)
+            groups = self_attn.search(key).groups()
+            fs_self_attn = "layers.{}.self_attn.{}_proj.{}"
+            fs_self_attn_ln = "layers.{}.self_attn_layer_norm.{}"
+            if int(groups[0]) >= num_layers:
+                new_key = None
+            elif "query" in key:
+                # print(fs_self_attn.format(groups[0], groups[2], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[2], groups[-1])
+            elif "key" in key:
+                # print(fs_self_attn.format(groups[0], groups[3], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[3], groups[-1])
+            elif "value" in key:
+                # print(fs_self_attn.format(groups[0], groups[4], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[4], groups[-1])
+            elif "output.dense" in key:
+                # print(fs_self_attn.format(groups[0], groups[5], groups[-1]))
+                new_key = fs_self_attn.format(groups[0], groups[5], groups[-1])
+            else:
+                # print(fs_self_attn_ln.format(groups[0], groups[-1]))
+                if groups[-1] == 'gamma':
+                    new_key = fs_self_attn_ln.format(groups[0], "weight")
+                else:
+                    new_key = fs_self_attn_ln.format(groups[0], "bias")
+
+        elif "dense" in key and "pooler" not in key and "cls" not in key:
+            groups = ffns.search(key).groups()
+            # print(groups)
+            ffns_f1 = "layers.{}.fc1.{}"
+            ffns_f2 = "layers.{}.fc2.{}"
+            if int(groups[0]) >= num_layers:
+                new_key = None
+            elif "intermediate" in key:
+                # print(ffns_f1.format(groups[0], groups[-1]))
+                new_key = ffns_f1.format(groups[0], groups[-1])
+            else:
+                # print(ffns_f2.format(groups[0], groups[-1]))
+                new_key = ffns_f2.format(groups[0], groups[-1])
+
+        elif "LayerNorm" in key and "cls" not in key:
+            # print(key)
+            groups = ffns_ln_p.search(key).groups()
+            ffns_ln = "layers.{}.final_layer_norm.{}"
+            # print(groups)
+            # print(ffns_ln.format(groups[0], groups[-1]))
+            if int(groups[0]) >= num_layers:
+                new_key = None
+            elif groups[-1] == "gamma":
+                new_key = ffns_ln.format(groups[0], "weight")
+            else:
+                new_key = ffns_ln.format(groups[0], "bias")
+
+        else:
+            new_key = None
+
+        if new_key is not None:
+            # print(model[key].shape)
+            # print(new_key, key)
+            # print(state_dict[new_key].shape, pretrained_state_dict[key].shape)
+            #print(key,new_key)
+
+            assert new_key in state_dict, (
+                "{} Transformer encoder / decoder "
+                "state_dict does not contain {}. Cannot "
+                "load {} from pretrained XLM checkpoint "
+                "{} into Transformer.".format(
+                    str(state_dict.keys()),
+                    new_key, key, pretrained_state_dict)
+                )
+
+            if new_key == "embed_tokens.weight":
+                state_dict[new_key][4:] = pretrained_state_dict[key]
+            elif new_key == "embed_positions.weight":
+                state_dict[new_key][2:] = pretrained_state_dict[key]
+            else:
+                assert state_dict[new_key].shape == pretrained_state_dict[key].shape
+                state_dict[new_key] = pretrained_state_dict[key]
+
+    return state_dict
 
 
 @register_model("transformer")
@@ -102,6 +209,18 @@ class TransformerModel(FairseqEncoderDecoderModel):
         super().__init__(encoder, decoder)
         self.args = args
         self.supports_align_args = True
+        if getattr(args, "bert_checkpoint", None) is not None:
+            pretrained_bert = torch.load(getattr(args, "bert_checkpoint"))
+            loaded_state_dict = upgrade_state_dict_with_pretrained_weights(encoder.state_dict(),pretrained_bert,args.decoder_layers)
+            encoder.load_state_dict(loaded_state_dict, strict=True)
+            decoder_state_dict = decoder.state_dict()
+            for k in decoder_state_dict.keys():
+                if k not in loaded_state_dict:
+                    if 'encoder_attn' in k and getattr(args, "init_CA_with_SA", False):
+                        loaded_state_dict[k] = loaded_state_dict[k.replace('encoder_attn', 'self_attn')]
+                    else:
+                        loaded_state_dict[k] = decoder_state_dict[k]
+            decoder.load_state_dict(loaded_state_dict, strict=True)
 
     @staticmethod
     def add_args(parser):
@@ -189,6 +308,10 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='block size of quantization noise at training time')
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')
+        parser.add_argument(
+            "--bert-checkpoint",
+            help="path of the bert state dict file",
+        )
         # fmt: on
 
     @classmethod
@@ -202,7 +325,6 @@ class TransformerModel(FairseqEncoderDecoderModel):
             args.encoder_layers = len(args.encoder_layers_to_keep.split(","))
         if args.decoder_layers_to_keep:
             args.decoder_layers = len(args.decoder_layers_to_keep.split(","))
-
         if getattr(args, "max_source_positions", None) is None:
             args.max_source_positions = DEFAULT_MAX_SOURCE_POSITIONS
         if getattr(args, "max_target_positions", None) is None:
@@ -335,7 +457,6 @@ class TransformerEncoder(FairseqEncoder):
         embed_dim = embed_tokens.embedding_dim
         self.padding_idx = embed_tokens.padding_idx
         self.max_source_positions = args.max_source_positions
-
         self.embed_tokens = embed_tokens
 
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
@@ -1020,59 +1141,49 @@ def base_architecture(args):
 
 
 @register_model_architecture("transformer", "transformer_bert2bert")
-def ber2bert_architecture(args):
+def transformer_bert2bert(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
-    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 2048)
-    args.encoder_layers = getattr(args, "encoder_layers", 6)
-    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 8)
+    args.layernorm_embedding = getattr(args, "layernorm_embedding", True)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 768)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 3072)
+    args.encoder_layers = getattr(args, "encoder_layers", 12)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", 16)
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", False)
-    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", True)
+
     args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_ffn_embed_dim = getattr(
         args, "decoder_ffn_embed_dim", args.encoder_ffn_embed_dim
     )
-    args.decoder_layers = getattr(args, "decoder_layers", 6)
-    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
+    args.decoder_layers = getattr(args, "decoder_layers", 12)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 16)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", False)
-    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
-    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
+    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", True)
+
+    args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     args.activation_dropout = getattr(args, "activation_dropout", 0.0)
-    args.activation_fn = getattr(args, "activation_fn", "relu")
+
+    args.activation_fn = getattr(args, "activation_fn", "gelu")
     args.dropout = getattr(args, "dropout", 0.1)
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
     args.share_decoder_input_output_embed = getattr(
-        args, "share_decoder_input_output_embed", False
+        args, "share_decoder_input_output_embed", True
     )
-    args.share_all_embeddings = getattr(args, "share_all_embeddings", False)
+    args.share_all_embeddings = getattr(args, "share_all_embeddings", True)
     args.no_token_positional_embeddings = getattr(
         args, "no_token_positional_embeddings", False
     )
     args.adaptive_input = getattr(args, "adaptive_input", False)
-    args.no_cross_attention = getattr(args, "no_cross_attention", False)
-    args.cross_self_attention = getattr(args, "cross_self_attention", False)
 
     args.decoder_output_dim = getattr(
         args, "decoder_output_dim", args.decoder_embed_dim
     )
     args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
+    args.max_source_positions = getattr(args, "max_source_positions", 512)
+    args.max_target_positions = getattr(args, "max_target_positions", 512)
 
-    args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
-    args.layernorm_embedding = getattr(args, "layernorm_embedding", False)
-    args.tie_adaptive_weights = getattr(args, "tie_adaptive_weights", False)
-    args.checkpoint_activations = getattr(args, "checkpoint_activations", False)
-    args.offload_activations = getattr(args, "offload_activations", False)
-    if args.offload_activations:
-        args.checkpoint_activations = True
-    args.encoder_layers_to_keep = getattr(args, "encoder_layers_to_keep", None)
-    args.decoder_layers_to_keep = getattr(args, "decoder_layers_to_keep", None)
-    args.encoder_layerdrop = getattr(args, "encoder_layerdrop", 0)
-    args.decoder_layerdrop = getattr(args, "decoder_layerdrop", 0)
-    args.quant_noise_pq = getattr(args, "quant_noise_pq", 0)
-    args.quant_noise_pq_block_size = getattr(args, "quant_noise_pq_block_size", 8)
-    args.quant_noise_scalar = getattr(args, "quant_noise_scalar", 0)
 
 @register_model_architecture("transformer", "transformer_iwslt_de_en")
 def transformer_iwslt_de_en(args):

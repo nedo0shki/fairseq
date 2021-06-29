@@ -34,6 +34,7 @@ class IterativeRefinementGenerator(object):
         init_tokens=None,
         oracle_delete=False,
         oracle_insertion=False,
+        confidence = 0,
     ):
         """
         Generates translations based on iterative refinement.
@@ -64,6 +65,7 @@ class IterativeRefinementGenerator(object):
         self.init_tokens = init_tokens
         self.oracle_del = oracle_delete
         self.oracle_ins = oracle_insertion
+        self.confidence = confidence
 
     def generate_batched_itr(
         self,
@@ -105,12 +107,10 @@ class IterativeRefinementGenerator(object):
 
     @torch.no_grad()
     def generate(self, models, sample, prefix_tokens=None):
-
         # TODO: iterative refinement generator does not support ensemble for now.
         if not self.retain_dropout:
             for model in models:
                 model.eval()
-
         model, reranker = models[0], None
         if self.reranking:
             assert len(models) > 1, "Assuming the last checkpoint is the reranker"
@@ -126,7 +126,6 @@ class IterativeRefinementGenerator(object):
                 model.__class__.__name__
             )
             model.enable_ensemble(models)
-
         # TODO: better encoder inputs?
         src_tokens = sample["net_input"]["src_tokens"]
         src_lengths = sample["net_input"]["src_lengths"]
@@ -145,7 +144,8 @@ class IterativeRefinementGenerator(object):
         #if self.init_tokens is not None:
         #    init_tokens = sample[self.init_tokens]
         if self.init_tokens == 'src':
-            init_tokens = sample['net_input']['src_tokens']
+            #init_tokens = sample['net_input']['src_tokens']
+            init_tokens = sample["decoder_input"][0]
         if self.init_tokens == 'mt':
             init_tokens = sample['mt']
         prev_decoder_out = model.initialize_output_tokens(
@@ -223,13 +223,15 @@ class IterativeRefinementGenerator(object):
                 "decoding_format": self.decoding_format,
                 "oracle_del": self.oracle_del,
                 "oracle_ins": self.oracle_ins,
+                "confidence": self.confidence,
+                "tgt_tokens": tgt_tokens
             }
             prev_decoder_out = prev_decoder_out._replace(
                 step=step, max_step=self.max_iter + 1,
             )
 
             decoder_out = model.forward_decoder(
-                prev_decoder_out, encoder_out, tgt_tokens, **decoder_options
+                prev_decoder_out, encoder_out, **decoder_options
             )
 
             if self.adaptive:
@@ -303,7 +305,7 @@ class IterativeRefinementGenerator(object):
             encoder_out = model.encoder.reorder_encoder_out(
                 encoder_out, not_terminated.nonzero().squeeze()
             )
-            if tgt_tokens is not None:    
+            if tgt_tokens is not None:
                 tgt_tokens = tgt_tokens[not_terminated]
             sent_idxs = sent_idxs[not_terminated]
             prev_output_tokens = prev_decoder_out.output_tokens.clone()

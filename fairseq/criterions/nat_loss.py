@@ -92,10 +92,12 @@ class LabelSmoothedDualImitationCriterion(FairseqCriterion):
             sample["net_input"]["src_lengths"],
         )
         tgt_tokens, prev_output_tokens = sample["target"], sample["prev_target"]
+        '''
         train_step = None
         if 'train_step' in sample:
             train_step = sample['train_step']
-        outputs = model(src_tokens, src_lengths, prev_output_tokens, tgt_tokens, train_step)
+        '''
+        outputs = model(src_tokens, src_lengths, prev_output_tokens, tgt_tokens)
         losses, nll_loss = [], []
 
         for obj in outputs:

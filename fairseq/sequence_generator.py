@@ -298,7 +298,7 @@ class SequenceGenerator(nn.Module):
             original_batch_idxs = sample["id"]
         else:
             original_batch_idxs = torch.arange(0, bsz).type_as(tokens)
-
+        #all_p_gens = []
         for step in range(max_len + 1):  # one extra step for EOS marker
             # reorder decoder internal states based on the prev choice of beams
             if reorder_state is not None:
@@ -322,6 +322,20 @@ class SequenceGenerator(nn.Module):
                 incremental_states,
                 self.temperature,
             )
+
+            '''
+            lprobs, avg_attn_scores, p_gens = self.model.forward_decoder(
+                tokens[:, : step + 1],
+                encoder_outs,
+                incremental_states,
+                self.temperature,
+            )
+            p_gens = p_gens.squeeze().tolist()
+            if type(p_gens) != list:
+                p_gens = [p_gens]
+            p_gens = [round(p,2) for p in p_gens]
+            all_p_gens.extend(p_gens)
+            '''
             if self.lm_model is not None:
                 lm_out = self.lm_model(tokens[:, : step + 1])
                 probs = self.lm_model.get_normalized_probs(
@@ -546,7 +560,9 @@ class SequenceGenerator(nn.Module):
             finalized[sent] = torch.jit.annotate(
                 List[Dict[str, Tensor]], finalized[sent]
             )
+
         #print("finalized: ", len(finalized))
+        #return finalized, all_p_gens
         return finalized
 
     def _prefix_tokens(
@@ -804,13 +820,13 @@ class EnsembleModel(nn.Module):
             )
             probs = probs[:, -1, :]
             if self.models_size == 1:
-                '''
+
                 if len(decoder_out) > 2:
                     # to return p_gens
                     return probs, attn, decoder_out[2]
                 else:
-                '''
-                return probs, attn
+
+                    return probs, attn
 
             log_probs.append(probs)
             if attn is not None:
